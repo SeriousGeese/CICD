@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Keeps the SHA pins in .github/workflows/* moving on a schedule rather than by
+  # hand, and rewrites the trailing version comment alongside the SHA so the two
+  # cannot drift apart.
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: '/'
+    schedule:
+      interval: weekly
+    groups:
+      dev-tooling:
+        patterns: ['*']
+        update-types: ['minor', 'patch']

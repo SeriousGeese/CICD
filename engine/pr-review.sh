@@ -401,7 +401,7 @@ stacked_base_violation() {
 # A dependency that is CLOSED but not merged counts as UNMET: it may itself have
 # been orphaned by this very bug, and merging past it would compound the damage.
 unmet_dependencies() {
-  local body refs ref num state rc=0 unmet=""
+  local body refs num state rc=0 unmet=""
   body="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json body --jq .body 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log "body lookup FAILED (rc=${rc}) — failing closed"
@@ -2944,7 +2944,8 @@ $(head -300 "$f")"
       fi
     done < <(git diff --name-only "origin/${PR_BASE_REF}...HEAD" 2>/dev/null | head -10)
 
-    local user_content="PR Title: ${PR_TITLE}
+    local user_content
+    user_content="PR Title: ${PR_TITLE}
 
 PR Description:
 ${PR_BODY:-none}
