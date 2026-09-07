@@ -1,0 +1,123 @@
+name: 'PR auto-review'
+description: >-
+  Runs the shared PR auto-review engine against one pull request: LLM review,
+  optional auto-fix, quality gates via the consumer's .cicd/quality-gates.sh, CI
+  wait, and (for allowlisted authors) merge.
+inputs:
+  pr-number:      { description: 'PR number to review',                  required: true }
+  pr-head-ref:    { description: 'PR head branch',                       required: true }
+  pr-base-ref:    { description: 'PR base branch',                       required: true }
+  pr-title:       { description: 'PR title',                             required: false, default: '' }
+  pr-body:        { description: 'PR body',                              required: false, default: '' }
+  pr-author:      { description: 'PR author login',                      required: true }
+  pr-html-url:    { description: 'PR URL',                               required: false, default: '' }
+  head-sha:       { description: 'PR head SHA',                          required: true }
+  base-sha:       { description: 'PR base SHA',                          required: true }
+  repo:           { description: 'owner/repo',                           required: true }
+  work-dir:       { description: 'Checkout directory for the PR branch', required: true }
+  github-token:   { description: 'GITHUB_TOKEN',                         required: true }
+  openrouter-api-key:
+    description: >-
+      OpenRouter key. May be EMPTY: a Dependabot-triggered run receives no Actions
+      secrets, and the engine reports that as a clean skip rather than a failed
+      review — a bot that could not review must not present as one that reviewed
+      and found the PR wanting.
+    required: false
+    default: ''
+  openrouter-model:          { description: 'Primary model id',   required: false, default: '' }
+  openrouter-fallback-model: { description: 'Fallback model id',  required: false, default: '' }
+  automerge-authors:
+    description: >-
+      Comma-separated logins whose PRs get auto-fix pushes and auto-merge.
+      Everyone else gets a comment-only review. EMPTY MEANS MERGE NOBODY, which is
+      the safe default and what a shadow-mode rollout should pass.
+    required: false
+    default: ''
+  strict-skipped:
+    description: >-
+      Treat ANY skipped check as unresolved, not just a skipped REQUIRED one.
+      Set true for a repo WITHOUT an aggregate `gate` job. The precise rule
+      depends on required_contexts(), which FAILS OPEN — so with a wrong or empty
+      required set every skipped check reads as a pass and the merge gate quietly
+      stops gating.
+    required: false
+    default: 'false'
+  dry-run:
+    description: >-
+      Review and comment, but never push a fix or merge. Use for shadow-mode
+      rollout alongside an incumbent reviewer.
+    required: false
+    default: 'false'
+  config-file:
+    description: 'Per-repo config sourced before the engine runs.'
+    required: false
+    default: '.cicd/config.env'
+outputs:
+  result:
+    description: 'Engine verdict (reviewed | commented | merged | blocked | skipped_dependabot | no_llm_credentials | …)'
+    value: ${{ steps.review.outputs.result }}
+  comment-path:
+    description: 'Path to the rendered PR comment.'
+    value: ${{ steps.review.outputs.comment_path }}
+runs:
+  using: composite
+  steps:
+    # The engine runs from THIS action's checkout, never from the PR's. A PR must
+    # not be able to edit the reviewer that decides whether it merges. The one
+    # deliberate exception is .cicd/quality-gates.sh, which the engine reads from
+    # WORK_DIR (the PR head) because it IS product code and a PR that changes the
+    # build must be reviewable as part of that PR.
+    - name: Run PR auto-review
+      id: review
+      shell: bash
+      env:
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_HEAD_REF: ${{ inputs.pr-head-ref }}
+        PR_BASE_REF: ${{ inputs.pr-base-ref }}
+        PR_TITLE: ${{ inputs.pr-title }}
+        PR_BODY: ${{ inputs.pr-body }}
+        PR_AUTHOR: ${{ inputs.pr-author }}
+        PR_HTML_URL: ${{ inputs.pr-html-url }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        REPO: ${{ inputs.repo }}
+        WORK_DIR: ${{ inputs.work-dir }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+        OPENROUTER_MODEL: ${{ inputs.openrouter-model }}
+        OPENROUTER_FALLBACK_MODEL: ${{ inputs.openrouter-fallback-model }}
+        AUTOMERGE_AUTHORS: ${{ inputs.automerge-authors }}
+        CICD_STRICT_SKIPPED: ${{ inputs.strict-skipped }}
+        CICD_DRY_RUN: ${{ inputs.dry-run }}
+        CICD_CONFIG_FILE: ${{ inputs.config-file }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        # Per-repo config, from the PR head. Only CICD_* names are honoured, and
+        # they are read as data rather than sourced as shell: this file arrives
+        # from the PR under review, so `source`ing it would hand a PR author
+        # arbitrary code execution inside the reviewer.
+        config="${WORK_DIR}/${CICD_CONFIG_FILE}"
+        if [ -f "$config" ]; then
+          echo "Loading ${CICD_CONFIG_FILE}"
+          while IFS='=' read -r key value; do
+            case "$key" in
+              CICD_*)
+                value="${value%\"}"; value="${value#\"}"
+                # An input passed explicitly wins over the file, so a shadow run
+                # can force dry-run regardless of what the branch says.
+                if [ -z "${!key:-}" ]; then
+                  printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+                  export "$key=$value"
+                fi
+                ;;
+            esac
+          done < <(grep -E '^\s*CICD_[A-Z_]+=' "$config" | sed 's/^[[:space:]]*//; s/[[:space:]]*#.*$//')
+        fi
+
+        # The engine's own review-prompt.md stays per-repo — it is product
+        # knowledge, not shared machinery.
+        export SYSTEM_PROMPT_FILE="${WORK_DIR}/scripts/review-prompt.md"
+
+        bash "${ACTION_PATH}/../../engine/pr-review.sh"

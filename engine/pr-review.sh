@@ -119,7 +119,13 @@ python_path() {
     printf '%s\n' "$1"
   fi
 }
-PROMPT_FILE="${SCRIPT_DIR}/review-prompt.md"
+# The review prompt is PER-REPO and deliberately not in this repo: DnD's names
+# Adventure Packs and DM/Player/Admin roles, PromptCI's names detector determinism.
+# It is product knowledge, so it lives with the product and arrives via
+# SYSTEM_PROMPT_FILE (the composite action points this at the PR's own
+# scripts/review-prompt.md). SCRIPT_DIR remains the fallback so a repo that ships
+# the prompt beside the engine still works.
+PROMPT_FILE="${SYSTEM_PROMPT_FILE:-${SCRIPT_DIR}/review-prompt.md}"
 MAX_ITERATIONS=3
 MAX_DIFF_LINES=5000
 POLL_INTERVAL=30  # seconds between CI status checks
@@ -1038,6 +1044,13 @@ merge_error_oneline() {
 # now a CONDITIONAL fallback, because an unconditional ref delete closes dependent
 # PRs that GitHub's own merge-time auto-delete would have retargeted.
 merge_pr() {
+  # Shadow mode never merges. Belt-and-braces with review_may_apply_fixes(): a
+  # merge is the one action that cannot be walked back, so it is guarded at the
+  # gate AND at the door.
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    log "DRY RUN: would merge PR #${PR_NUMBER}; not merging."
+    return 1
+  fi
   local merged=false
   local blocking_label stacked_base unmet orphans
   local attempt=1 merge_out="" state=""
@@ -1330,6 +1343,10 @@ is_workflow_permission_rejection() {
 # hook is pure overhead here and safe to skip.
 push_review_commits() {
   local iterations="${1:-0}"
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    log "DRY RUN: would push auto-review commits to ${PR_HEAD_REF}; not pushing."
+    return 0
+  fi
   local push_output="" push_rc=0
   push_output="$(git push --no-verify origin "HEAD:${PR_HEAD_REF}" 2>&1)" || push_rc=$?
   printf '%s\n' "$push_output" >&2
@@ -1662,6 +1679,16 @@ is_version_pin_change() {
   [ "$norm_old" = "$norm_new" ]
 }
 
+# Shadow mode. Review and comment exactly as normal, but never write to the
+# author's branch and never merge.
+#
+# This is what makes a safe rollout possible: a consumer runs the new engine
+# alongside its incumbent reviewer on real PRs and DIFFS THE TWO COMMENTS. Any
+# divergence is found on live traffic, for free, before anything can act on it.
+# Checked here rather than at each call site so there is one place to be sure of.
+CICD_DRY_RUN="${CICD_DRY_RUN:-false}"
+case "$CICD_DRY_RUN" in 1|true|TRUE|yes) CICD_DRY_RUN=true ;; *) CICD_DRY_RUN=false ;; esac
+
 # The single gate on touching the author's branch. Three independent reasons to
 # refuse, all of which still produce a full comment-only review:
 #   - the author is not on the auto-merge allowlist, or a hold label is on
@@ -1671,6 +1698,9 @@ is_version_pin_change() {
 # than only through the 400-line converge loop that calls it.
 review_may_apply_fixes() {
   local automerge_eligible="$1"
+  # Dry run is checked FIRST and unconditionally: shadow mode must be impossible
+  # to talk past, whatever the allowlist or the tier says.
+  [ "$CICD_DRY_RUN" = "true" ] && return 1
   [ "$automerge_eligible" = "true" ] || return 1
   llm_tier_is_paid || return 1
   return 0

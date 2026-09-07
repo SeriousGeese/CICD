@@ -1,0 +1,45 @@
+name: 'Resolve gh CLI on this runner'
+description: >-
+  Finds a usable `gh` on the runner that is ACTUALLY executing and exports it as
+  $GH_CLI. Must run before anything that shells out to gh.
+inputs:
+  hint:
+    description: >-
+      Preferred gh path — a HINT, not the answer. Pass `vars.GH_CLI_PATH`. A repo
+      variable has ONE value repo-wide, and a pr-review fleet is heterogeneous
+      (Bazzite/linuxbrew vs Ubuntu/apt), so a value that is wrong for the current
+      runner must not be fatal.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    # Why this is not just `gh`: pr-review.sh's has_do_not_merge_label() FAILS
+    # CLOSED when gh cannot run (rc=127), which silently holds a PR nobody
+    # labelled. A missing gh must therefore fail the job loudly here rather than
+    # be discovered as a mysterious hold later.
+    - shell: bash
+      env:
+        GH_CLI_HINT: ${{ inputs.hint }}
+      run: |
+        set -euo pipefail
+        runner_name="${RUNNER_NAME:-unknown-runner}"
+        echo "RUNNER_HOST=${runner_name%-pr-review}" >> "$GITHUB_ENV"
+
+        for candidate in \
+          "${GH_CLI_HINT:-}" \
+          "$(command -v gh 2>/dev/null || true)" \
+          /home/linuxbrew/.linuxbrew/bin/gh \
+          /usr/local/bin/gh \
+          /usr/bin/gh \
+          /opt/homebrew/bin/gh
+        do
+          [ -n "$candidate" ] || continue
+          [ -x "$candidate" ] || continue
+          echo "GH_CLI=$candidate" >> "$GITHUB_ENV"
+          echo "Resolved gh on ${runner_name}: $candidate ($("$candidate" --version 2>&1 | head -1))"
+          exit 0
+        done
+
+        echo "::error::gh CLI not found on runner '${runner_name}'. Install gh there, or set the GH_CLI_PATH repo variable to a path that exists on every runner this job can land on."
+        exit 1
