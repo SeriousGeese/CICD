@@ -107,6 +107,10 @@ ci_status_json() {
   local sha="${1:-}"
   local superseded="${2:-[]}"
   local required="${3:-[]}"
+  # Treat ANY skipped check as unresolved, not just a skipped REQUIRED one.
+  # Defaults off (the precise rule). See $strict_skipped in ci-status.jq.
+  local strict_skipped="${4:-${CICD_STRICT_SKIPPED:-false}}"
+  case "$strict_skipped" in 1|true) strict_skipped=true ;; *) strict_skipped=false ;; esac
   local raw="" parsed="" rc=0 jq_rc=0
 
   raw="$("${GH_CLI:-gh}" api --paginate "repos/${REPO:-}/commits/${sha}/check-runs?per_page=100" 2>&1)" || rc=$?
@@ -120,6 +124,7 @@ ci_status_json() {
   parsed="$(printf '%s' "$raw" | jq -s \
     --argjson superseded "$superseded" \
     --argjson required "$required" \
+    --argjson strict_skipped "$strict_skipped" \
     -f "$CI_STATUS_JQ" 2>&1)" || jq_rc=$?
   if [ "$jq_rc" -ne 0 ] || [ -z "$parsed" ]; then
     log "  check-runs jq parse FAILED (exit=${jq_rc}): $(printf '%s' "$parsed" | head -c 200)"

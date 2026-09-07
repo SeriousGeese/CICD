@@ -66,7 +66,7 @@ const posix = (p) => p.split(path.sep).join('/');
 function jqOutputShape() {
   const out = spawnSync(
     'jq',
-    ['-s', '--argjson', 'superseded', '[]', '--argjson', 'required', '[]', '-f', path.join(scriptsDir, 'ci-status.jq')],
+    ['-s', '--argjson', 'superseded', '[]', '--argjson', 'required', '[]', '--argjson', 'strict_skipped', 'false', '-f', path.join(scriptsDir, 'ci-status.jq')],
     {
       input: JSON.stringify({
         total_count: 1,

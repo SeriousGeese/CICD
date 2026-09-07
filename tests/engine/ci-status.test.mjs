@@ -28,7 +28,7 @@ function ciStatus(pages, { superseded = [], required = [] } = {}) {
       JSON.stringify(superseded),
       '--argjson',
       'required',
-      JSON.stringify(required),
+      JSON.stringify(required), '--argjson', 'strict_skipped', 'false',
       '-f',
       jqProgram,
     ],

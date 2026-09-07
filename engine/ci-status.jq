@@ -114,7 +114,18 @@
       and $r.conclusion != "neutral"
       and $r.conclusion != "failure"
       and (
+        # A `skipped` check is a PASS unless it is a REQUIRED context, in which
+        # case GitHub will not merge on it and it is a terminal non-verdict.
+        #
+        # $strict_skipped restores the blunter rule DnD's inline implementation
+        # used: ANY skipped check is unresolved, required or not. That rule is
+        # cruder, but it is safe when $required is empty — and $required comes
+        # from required_contexts(), which FAILS OPEN to a fallback. A repo whose
+        # fallback is wrong therefore has no required set, every skipped check
+        # reads as a pass, and the merge gate quietly stops gating. A repo without
+        # an aggregate `gate` job should set this until it has one.
         $r.conclusion != "skipped"
+        or $strict_skipped
         or (($required | index($r.name)) != null)
       )
     )]) as $unresolved_runs
@@ -147,7 +158,11 @@
         $r.conclusion != "success"
         and $r.conclusion != "neutral"
         and (
+          # Same strict-skipped rule as $unresolved_runs above — these two
+          # predicates must agree, or `pending` and `all_success` disagree with
+          # `unresolved` and the poller sees a state that cannot happen.
           $r.conclusion != "skipped"
+          or $strict_skipped
           or (($required | index($r.name)) != null)
         )
       )
