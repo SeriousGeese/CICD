@@ -1540,163 +1540,84 @@ except Exception:
   return 1
 }
 
-# Transient npm-registry failures on the runner (socket timeouts, DNS, resets)
-# are NOT a defect in the PR under review — but a bare `npm ci` failure here used
-# to be reported as a failed quality gate, which discarded the LLM's fixes and
-# merged the PR unreviewed. That was the real cause of every "converge failed →
-# merge original" outcome we saw (3 of the last 40 reviews, all `npm ci` socket
-# timeouts; DnD-1sux0). Retry on network-shaped errors, and hand the
-# caller a distinct `infra_fail` status so a persistent registry outage BLOCKS
-# (and re-reviews) instead of masquerading as a clean review.
-NPM_NETWORK_ERR_RE='Socket timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|ENOTFOUND|ECONNREFUSED|network request .* failed|request to .* failed|registry error|50[234] '
-NPM_CI_OUTPUT=""
-
-# Runs `npm ci` with npm's own transport hardening plus an outer retry that
-# only fires on network-shaped errors. Sets NPM_CI_OUTPUT to the last attempt's
-# output. Returns: 0 = installed, 1 = NON-network failure (e.g. lockfile out of
-# sync — a real PR problem the review should surface), 2 = network error that
-# persisted across every retry (infra).
-npm_ci_resilient() {
-  # Per-attempt budget. The previous values (fetch-timeout 300s × 5 retries,
-  # compounding per tarball) let ONE attempt run ~22 min on a dead route, and
-  # three attempts held a runner for 67 min (run 32582354431, DnD-xqpyv). npm's
-  # inner retries and our outer loop both exist; keep the inner ones short so
-  # the outer loop — which also clears the partial install — does the work.
-  npm config set fetch-retries 2 >/dev/null 2>&1 || true
-  npm config set fetch-retry-mintimeout 10000 >/dev/null 2>&1 || true
-  npm config set fetch-retry-maxtimeout 30000 >/dev/null 2>&1 || true
-  npm config set fetch-timeout 60000 >/dev/null 2>&1 || true
-  # The 67-minute run above was `connect ETIMEDOUT 2606:4700::6810:522:443` —
-  # the runner resolved registry.npmjs.org to an IPv6 address it cannot reach
-  # and sat in the timeout on every tarball. Prefer A records for the install;
-  # a host whose v6 works loses nothing, a host whose v6 is dead stops burning
-  # the whole retry budget on it.
-  local node_opts="${NODE_OPTIONS:-}"
-  case "$node_opts" in
-    *dns-result-order*) ;;
-    *) node_opts="${node_opts:+$node_opts }--dns-result-order=ipv4first" ;;
-  esac
-
-  local attempt max=3 out
-  for attempt in $(seq 1 "$max"); do
-    if out="$(NODE_OPTIONS="$node_opts" npm ci --no-audit --no-fund --prefer-offline 2>&1)"; then
-      NPM_CI_OUTPUT="$out"
-      return 0
-    fi
-    NPM_CI_OUTPUT="$out"
-    if ! grep -qiE "$NPM_NETWORK_ERR_RE" <<< "$out"; then
-      return 1  # real, non-network failure — don't waste retries on it
-    fi
-    log "  [npm ci] network error (attempt ${attempt}/${max}) — cleaning partial install and backing off..."
-    rm -rf node_modules 2>/dev/null || true
-    [ "$attempt" -lt "$max" ] && sleep $((attempt * 10))
-  done
-  return 2
+# Ask the consumer's hook to make dependencies match the manifest.
+#
+# Replaces npm_ci_resilient(), which hard-coded `npm ci` plus npm-specific
+# transport hardening and a network-error regex. All of that is package-manager
+# knowledge, and it now lives in each consumer's .cicd/quality-gates.sh alongside
+# the gates that need it — DnD's wraps npm, the two PromptCI repos' wrap pnpm.
+#
+# The property the retired version existed to protect is PRESERVED, just moved:
+# a transient registry failure is not a defect in the PR, so the hook reports it
+# as 2 (infra) and the engine BLOCKS rather than discarding the review's fixes and
+# merging the PR unreviewed. That failure mode caused 3 of 40 reviews to merge
+# over an unrun review before it was found (DnD-1sux0), which is why the exit-2
+# channel exists at all rather than a plain pass/fail.
+#
+# Returns the hook's own status so the caller can tell a real failure (lockfile
+# drift — a defect in the PR) from an infra one.
+run_install_hook() {
+  local hook="${WORK_DIR}/.cicd/quality-gates.sh"
+  [ -f "$hook" ] || hook="${SCRIPT_DIR}/hooks/default-quality-gates.sh"
+  [ -f "$hook" ] || { log "  no quality-gates hook available for install"; return 2; }
+  local out rc=0
+  out="$(bash "$hook" install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | tail -20 >&2
+  return "$rc"
 }
 
+# Run the consumer repo's quality gates.
+#
+# The gates themselves are NOT in this repo. Each consumer supplies
+# `.cicd/quality-gates.sh`, and it is taken from the PR HEAD rather than from a
+# pinned CICD ref, deliberately: it is product code, and a PR that changes how the
+# project builds must be reviewable as part of that PR. Everything else the engine
+# runs comes from a trusted ref precisely because it must NOT be PR-authored.
+#
+# This is also the seam that dissolves npm-vs-pnpm. DnD ran `npm ci` + jest shards;
+# PromptCI and promptci-cloud run `pnpm install --frozen-lockfile` + vitest. Rather
+# than merge three package-manager-specific gate blocks into one script, the engine
+# stops knowing about package managers at all.
+#
+# Hook contract:
+#   .cicd/quality-gates.sh run   0 = pass | 1 = a gate failed | 2 = infra/network
+#     on 1, failure context on STDOUT — fed back to the LLM verbatim as the next
+#     iteration's input, so it must be the tool's own output, not a summary.
+#
+# The engine's OWN contract to its callers is unchanged and deliberately so: stdout
+# is the failure context, and the LAST LINE is one of pass|fail|infra_fail. Every
+# caller downstream (the converge loop, the discard-fixes branch, the merge gate)
+# reads it that way, so this stays an adapter rather than a refactor.
 run_quality_gates() {
-  local result="pass"
-  local output=""
+  local hook="${WORK_DIR}/.cicd/quality-gates.sh"
+  local output="" rc=0
 
-  log "Running quality gates..."
-  cd "$WORK_DIR"
+  cd "$WORK_DIR" || { echo "=== END ==="; echo "infra_fail"; return; }
 
-  # Fresh worktree has no node_modules — every gate below needs them
-  if [ ! -d node_modules ]; then
-    log "  [npm ci] installing dependencies..."
-    npm_ci_resilient
-    local npm_rc=$?
-    if [ "$npm_rc" -eq 2 ]; then
-      log "  [npm ci] FAILED — persistent network/registry error (infra, not the PR)"
-      echo "=== NPM CI NETWORK FAILURE (infra) ==="
-      echo "$NPM_CI_OUTPUT" | tail -20
+  if [ ! -f "$hook" ]; then
+    # No consumer hook: fall back to the bundled default. SCRIPT_DIR is the
+    # extracted tools dir at runtime, so hooks/ ships with the engine.
+    hook="${SCRIPT_DIR}/hooks/default-quality-gates.sh"
+    if [ ! -f "$hook" ]; then
+      log "  [gates] no .cicd/quality-gates.sh and no bundled default — cannot verify this PR"
       echo "=== END ==="
+      # infra_fail, NOT fail: nothing was run, so nothing is known about the PR.
+      # `fail` would read as "the code is broken" and discard the LLM's fixes.
       echo "infra_fail"
-      return
-    elif [ "$npm_rc" -ne 0 ]; then
-      log "  [npm ci] FAILED — non-network (e.g. lockfile out of sync with package.json)"
-      echo "=== NPM CI FAILURE ==="
-      echo "$NPM_CI_OUTPUT" | tail -20
-      echo "=== END ==="
-      echo "fail"
       return
     fi
   fi
 
-  # CI applies migrations before test/build (ci.yml); a fresh worktree has no
-  # dev DB, so tests and prerender fail without this. Idempotent.
-  log "  [db:migrate] ..."
-  if ! output="$(npm run db:migrate 2>&1)"; then
-    log "  [db:migrate] FAILED"
-    echo "=== DB MIGRATE FAILURE ==="
-    echo "$output" | tail -20
-    echo "=== END ==="
-    echo "fail"
-    return
-  fi
+  log "Running quality gates via ${hook#"${WORK_DIR}/"} ..."
+  output="$(bash "$hook" run 2>&1)" || rc=$?
 
-  # First, try auto-fix for lint issues
-  log "  [lint --fix] ..."
-  npm run lint -- --fix 2>/dev/null || true
-  git add -A 2>/dev/null || true
-
-  # TypeScript type check
-  log "  [type-check] ..."
-  if ! output="$(npm run type-check 2>&1)"; then
-    result="fail"
-    log "  [type-check] FAILED"
-    echo "=== TYPE-CHECK FAILURE ==="
-    echo "$output" | tail -40
-    echo "=== END ==="
-    echo "$result"
-    return
-  else
-    log "  [type-check] PASS"
-  fi
-
-  # Lint
-  log "  [lint] ..."
-  if ! output="$(npm run lint 2>&1)"; then
-    result="fail"
-    log "  [lint] FAILED"
-    echo "=== LINT FAILURE ==="
-    echo "$output" | tail -40
-    echo "=== END ==="
-    echo "$result"
-    return
-  else
-    log "  [lint] PASS"
-  fi
-
-  # Tests (no coverage to save time)
-  log "  [test] ..."
-  if ! output="$(npm test -- --no-coverage --maxWorkers=50% 2>&1)"; then
-    result="fail"
-    log "  [test] FAILED"
-    echo "=== TEST FAILURE ==="
-    echo "$output" | tail -40
-    echo "=== END ==="
-    echo "$result"
-    return
-  else
-    log "  [test] PASS"
-  fi
-
-  # Build
-  log "  [build] ..."
-  if ! output="$(npm run build 2>&1)"; then
-    result="fail"
-    log "  [build] FAILED"
-    echo "=== BUILD FAILURE ==="
-    echo "$output" | tail -40
-    echo "=== END ==="
-    echo "$result"
-    return
-  else
-    log "  [build] PASS"
-  fi
-
-  echo "pass"
+  printf '%s\n' "$output" | tail -60
+  echo "=== END ==="
+  case "$rc" in
+    0) log "  [gates] PASS"; echo "pass" ;;
+    2) log "  [gates] INFRA FAILURE — not a defect in this PR"; echo "infra_fail" ;;
+    *) log "  [gates] FAILED (exit ${rc})"; echo "fail" ;;
+  esac
 }
 
 # ── Version-pin guard (DnD-iu4qj) ─────────────────────────────────────────────
@@ -1721,11 +1642,19 @@ normalize_versions() {
 # apply; the guard targets the "correcting" of pins, which is only ever the
 # whole fix. package-lock.json is rejected outright — hand-editing it is never
 # a legitimate review fix.
+#
+# The lockfile list is DATA, not package-manager machinery: the engine must know
+# which files it refuses to let a model hand-edit, but never how to run an
+# installer. It covers all three ecosystems in the fleet — DnD is npm, PromptCI
+# and promptci-cloud are pnpm, and only npm's name was here before, so the two
+# pnpm repos' lockfiles were entirely unguarded.
+LOCKFILE_NAMES='package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lockb'
+
 is_version_pin_change() {
   local path="$1" old="$2" new="$3"
-  if [ "$(basename "$path")" = "package-lock.json" ]; then
-    return 0
-  fi
+  case " ${LOCKFILE_NAMES} " in
+    *" $(basename "$path") "*) return 0 ;;
+  esac
   [ "$old" = "$new" ] && return 1
   local norm_old norm_new
   norm_old="$(normalize_versions <<< "$old")"
@@ -2897,23 +2826,19 @@ ${suggestions}"
       break
     fi
 
-    # Check if require_npm_ci or require_npm_install
-    local req_npm_ci req_npm_install
-    req_npm_ci="$(echo "$json_fixes" | jq -r '.require_npm_ci // false' 2>/dev/null || echo "false")"
-    req_npm_install="$(echo "$json_fixes" | jq -r '.require_npm_install // false' 2>/dev/null || echo "false")"
+    # The review can ask for a dependency install when its fix adds one. The key
+    # names are historical (`require_npm_ci`/`require_npm_install`, still emitted
+    # by all three repos' prompts) but the ACTION is no longer npm-specific: both
+    # mean "make dependencies match the manifest", and the consumer's hook decides
+    # how — npm ci, pnpm install --frozen-lockfile, or otherwise.
+    local req_install
+    req_install="$(echo "$json_fixes" | jq -r '
+      if (.require_npm_ci // false) or (.require_npm_install // false)
+      then "true" else "false" end' 2>/dev/null || echo "false")"
 
-    if [ "$req_npm_ci" = "true" ]; then
-      log "Running npm ci (requested by LLM)..."
-      npm ci 2>&1 | tail -5
-    elif [ "$req_npm_install" = "true" ]; then
-      log "npm install requested by LLM — checking lockfile..."
-      if [ -f "package-lock.json" ]; then
-        log "  Lockfile exists — running npm ci instead (safer)"
-        npm ci 2>&1 | tail -5
-      else
-        log "  No lockfile — running npm install with --no-audit"
-        npm install --no-audit --no-fund 2>&1 | tail -5
-      fi
+    if [ "$req_install" = "true" ]; then
+      log "Dependency install requested by the review — delegating to the quality-gates hook..."
+      run_install_hook || log "  install hook reported a problem; the gates below will surface it"
     fi
 
     CONVERGE_ATTEMPTS="$(echo "$CONVERGE_ATTEMPTS" | jq '. += [{"check":"review","result":"fixes_applied"}]' 2>/dev/null || echo '[{"check":"review","result":"fixes_applied"}]')"
@@ -2962,7 +2887,7 @@ ${suggestions}"
   if [ "$infra_failed" = "true" ]; then
     git checkout -- . 2>/dev/null || true
     git clean -fd 2>/dev/null || true
-    finish "🚧 Quality gates could not run — the runner hit a persistent npm-registry/network error, so this PR was NOT reviewed. Blocking rather than merging over an unrun review. Push again, or re-run this workflow, to get a review. If it recurs, check the runner's network/registry access." "blocked_infra" "$iterations"
+    finish "🚧 Quality gates could not run — the runner hit a persistent registry/network error, so this PR was NOT reviewed. Blocking rather than merging over an unrun review. Push again, or re-run this workflow, to get a review. If it recurs, check the runner's network and package-registry access." "blocked_infra" "$iterations"
   fi
 
   # Review never completed → block the merge and say so. The sync merge (if
