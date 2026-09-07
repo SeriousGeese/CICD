@@ -3273,4 +3273,21 @@ See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a
   fi
 }
 
-main "$@"
+# Library mode (adopted from promptci-cloud).
+#
+# Sourcing this file to test ONE function must not start a review. Every
+# behavioural test in tests/engine/ depends on this guard: without it the only
+# way to exercise a function is to strip `main "$@"` with a regex first, which
+# is what DnD's and PromptCI's suites do today — a transformation that can
+# silently stop matching and leave the tests running against a mutated script.
+#
+# A guard rather than a bare `return`: `return` at top level is an error in a
+# file that is EXECUTED, and this file must keep working normally when it is.
+#
+# NOTE what this does NOT do: the script runs under `set -u` and reads its
+# required inputs (PR_NUMBER and friends) at source time, so a caller must still
+# export those before sourcing. Library mode suppresses the REVIEW, not the
+# preamble. tests/harness/ exports a fixture set for exactly this reason.
+if [ "${PR_REVIEW_LIBRARY_MODE:-0}" != "1" ]; then
+  main "$@"
+fi
