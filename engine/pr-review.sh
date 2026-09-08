@@ -672,8 +672,16 @@ dispatch_e2e_gate() {
 _HELD_RUNS_SEEN=""
 
 approve_held_runs() {
-  # approve nothing; a human approves held runs instead
-  [ "$CICD_FEATURE_APPROVE_HELD_RUNS" = "true" ] || { return 0; }
+  # Disabled: approve nothing, and report NOTHING APPROVED.
+  #
+  # `return 1`, not 0. The contract is "did I approve something", not "did I
+  # succeed" — the live function returns 1 when it found nothing to approve. Its
+  # only caller is
+  #     if approve_held_runs "$sha"; then zero_checks_elapsed=0; fi
+  # so returning 0 here would reset the zero-checks grace on EVERY poll, and the
+  # fail-closed that stops a checkless SHA merging could never fire. A disabled
+  # feature must be inert, not quietly permissive.
+  [ "$CICD_FEATURE_APPROVE_HELD_RUNS" = "true" ] || { return 1; }
   local sha="$1"
   local held api_exit=0 err_file
   # stderr goes to its own file rather than into $held: a `2>&1` capture would
