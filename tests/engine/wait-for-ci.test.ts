@@ -541,3 +541,46 @@ describe("wait_for_ci call sites", () => {
     }
   });
 });
+
+/**
+ * The docs-only grace is GONE, and must stay gone.
+ *
+ * `wait_for_ci` once took a third `ci_relevant` argument and returned 3 to let a
+ * SHA carrying ZERO check runs merge when the PR touched no CI-relevant path.
+ * The graft dropped it, because every consumer now publishes an aggregate
+ * context on every PR — a grace that exists to excuse a missing verdict is a
+ * liability once a verdict is guaranteed.
+ *
+ * Dropping it left `pr_touches_ci_paths` computed into a `ci_relevant` local
+ * that nothing read except a log line reading "PR CI-relevance", which decided
+ * nothing while looking exactly like a live gate. Worse for a SHARED engine: its
+ * case globs were hard-coded to ONE consumer's paths-ignore (`content/**`,
+ * `.beads/**`), so on the other two repos it was a repo-specific answer to a
+ * question nobody asked.
+ *
+ * These pin the removal from both ends, because a half-reintroduction — the
+ * helper back without the return, or the return back without the argument — is
+ * exactly the shape that reads as harmless.
+ */
+describe('the docs-only grace stays removed', () => {
+  const source = readFileSync(scriptPath, "utf8");
+
+  it('has no pr_touches_ci_paths, and no ci_relevant local', () => {
+    expect(source).not.toContain('pr_touches_ci_paths()');
+    expect(source).not.toMatch(/^\s*local ci_relevant\s*$/m);
+  });
+
+  it('never returns or handles 3 from wait_for_ci', () => {
+    const fn = source.slice(source.indexOf('wait_for_ci() {'));
+    expect(fn).not.toMatch(/^\s*return 3\s*$/m);
+    expect(source).not.toMatch(/ci_exit" -eq 3/);
+  });
+
+  it('keeps the siblings that ARE still wired to something', () => {
+    // pr_touches_e2e_paths gates dispatch_e2e_gate and pr_touches_stage_paths
+    // gates dispatch_stage_deploy — removing those would be a different change,
+    // and this stops the cleanup being over-applied by pattern.
+    expect(source).toContain('pr_touches_e2e_paths()');
+    expect(source).toMatch(/\$\(pr_touches_e2e_paths\)/);
+  });
+});
