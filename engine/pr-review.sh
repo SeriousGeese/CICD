@@ -1741,7 +1741,22 @@ CICD_FEATURE_STAGE_DEPLOY="$(cicd_flag CICD_FEATURE_STAGE_DEPLOY false)"
 CICD_FEATURE_BEADS="$(cicd_flag CICD_FEATURE_BEADS false)"
 CICD_FEATURE_DEPENDABOT_SKIP="$(cicd_flag CICD_FEATURE_DEPENDABOT_SKIP false)"
 
-# Required-check identity. ci-lib.sh reads REQUIRED_CHECKS_FALLBACK; consumers
+# Required-check identity.
+#
+# NOT YET FULLY WIRED, and saying so here rather than letting it look finished:
+# ci-status.jq computes `required_missing` and `required_not_passing`, but this
+# engine's wait_for_ci (inherited from DnD) reads NEITHER — it has no return code
+# for "a required context never registered", which is promptci-cloud's return 6.
+# So today the required set influences exactly one thing: whether a skipped check
+# counts as unresolved (see CICD_STRICT_SKIPPED). The rest is computed and
+# discarded.
+#
+# Grafting Cloud's return-6 path is deliberately deferred until Cloud's 500-line
+# wait_for_ci suite is ported — wait_for_ci is the second-riskiest function here
+# after check_ci_status, and changing it without a differential harness is the
+# mistake the check_ci_status swap avoided.
+#
+# ci-lib.sh reads REQUIRED_CHECKS_FALLBACK; consumers
 # configure CICD_REQUIRED_CHECKS_FALLBACK alongside their other CICD_* settings,
 # so bridge the two rather than making every repo know both names.
 #
@@ -2639,7 +2654,7 @@ main() {
   local automerge_eligible=false
 
   if [ "$CICD_FALLBACK_UNSET" = "true" ]; then
-    annotate warning "CICD_REQUIRED_CHECKS_FALLBACK is not set in .cicd/config.env, so the required-check fallback stays 'gate'. required_contexts() FAILS OPEN to it, so in a repo with no job named 'gate' every review blocks on a context that can never register. Set it to this repo's required check name(s)."
+    annotate warning "CICD_REQUIRED_CHECKS_FALLBACK is not set in .cicd/config.env, so the required-check fallback stays 'gate' (promptci-cloud's job name). It currently affects only the skipped-check rule — see CICD_STRICT_SKIPPED. Set it to this repo's required check name(s) before the required-context handling is wired up."
   fi
 
   # Dependabot short-circuit (from promptci-cloud). Placed before the
