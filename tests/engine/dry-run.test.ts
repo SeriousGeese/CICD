@@ -26,6 +26,28 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const engine = path.resolve(here, '..', '..', 'engine', 'pr-review.sh');
 const posix = (p: string) => p.split(path.sep).join('/');
 
+/**
+ * Clear all four merge holds. They are real API calls, and merge_pr re-reads
+ * every one of them on every attempt by design, so without stubs they fail
+ * closed on a 401 and the test never reaches the behaviour under test. Each
+ * returns 1 = "this hold does not apply" (they return 0, and echo, when they DO
+ * apply — the same inverted convention pr-review.sh uses throughout).
+ */
+const NO_HOLDS = `has_do_not_merge_label() { return 1; }
+stacked_base_violation() { return 1; }
+unmet_dependencies() { return 1; }
+would_orphan_children() { return 1; }
+MERGEABLE_POLL_TIMEOUT=1
+MERGEABLE_POLL_INTERVAL=1`;
+
+/**
+ * The mergeability poll is deliberately NOT stubbed out — the "does not poll in
+ * dry-run" case has to be able to observe it happening. Its budget is squeezed
+ * to one second instead, so a regression that lets a dry run fall through to it
+ * FAILS rather than hanging the suite for 300s. (That is not hypothetical: it is
+ * what this file did on the first run after the guard moved.)
+ */
+
 let dir: string;
 
 beforeAll(() => {
@@ -49,8 +71,12 @@ export CICD_DRY_RUN="${dryRun}"
 # shellcheck source=/dev/null
 source "${posix(engine)}"
 cleanup() { :; }
-# Any real write would go through one of these; make them loud instead.
+# Any real write would go through one of these; make them loud instead. GH_CLI
+# expands to \`gh\`, so a shell function by that name intercepts every API call
+# the engine makes — including the \`gh pr merge\` this file exists to prove
+# unreachable.
 git() { echo "GIT_CALLED: $*"; return 0; }
+gh() { echo "GH_CALLED: $*"; return 0; }
 ${body}
 `,
     'utf8',
@@ -78,21 +104,83 @@ if review_may_apply_fixes true; then echo "WOULD_APPLY"; else echo "REFUSED"; fi
   });
 
   it('refuses to merge', () => {
-    const out = callInDryRun('merge_pr || true', 'true');
-    expect(out).toMatch(/DRY RUN: would merge/);
+    const out = callInDryRun(`${NO_HOLDS}\nmerge_pr || true`, 'true');
+    expect(out).toMatch(/DRY RUN: no hold is in force/);
+    // The assertion that matters. `gh pr merge` is the only mutation in
+    // merge_pr, and moving the dry-run guard downward past the hold checks put
+    // more of the function in reach of a shadow run — so this pins the one line
+    // that must still be unreachable, rather than pinning where the guard sits.
+    expect(out).not.toMatch(/GH_CALLED: pr merge/);
+  });
+
+  it('does not poll mergeability in dry-run', () => {
+    // wait_for_mergeable is read-only, so it is not a safety question — it is a
+    // cost one. A shadow shares a single self-hosted runner with the reviewer it
+    // shadows, and this polls for up to 300s for an answer the shadow cannot act
+    // on.
+    const out = callInDryRun(`${NO_HOLDS}\nmerge_pr || true`, 'true');
+    expect(out).not.toMatch(/Mergeability:/);
+    expect(out).not.toMatch(/GH_CALLED: pr view .*mergeStateStatus/);
+  });
+
+  it('still evaluates the merge holds in dry-run, and reports the one in force', () => {
+    // The reason the guard is below the holds rather than at the top of
+    // merge_pr. A shadow whose every comment says only "would have merged"
+    // cannot be compared against a real reviewer that held the PR — the two
+    // diverge on every held PR for a reason that is in neither implementation.
+    const out = callInDryRun(
+      `has_do_not_merge_label() { echo "do-not-merge"; return 0; }
+stacked_base_violation() { return 1; }
+unmet_dependencies() { return 1; }
+would_orphan_children() { return 1; }
+merge_pr || true
+echo "HOLD_LABEL=$HOLD_LABEL"`,
+      'true',
+    );
+    expect(out).toMatch(/MERGE BLOCKED.*do-not-merge/);
+    expect(out).toContain('HOLD_LABEL=do-not-merge');
+    expect(out).not.toMatch(/GH_CALLED: pr merge/);
+  });
+
+  it('reports a dry run as `would_merge`, and never claims GitHub refused', () => {
+    // `blocked` is a verdict about the PR. Reporting it for a shadow run puts a
+    // red-looking result on every PR the shadow sees, including every one the
+    // real reviewer merged — and the accompanying sentence said "the merge was
+    // refused ... GitHub reported:", which is a fabrication: GitHub was never
+    // asked.
+    const out = callInDryRun(
+      `${NO_HOLDS}\nmerge_pr || true\necho "RESULT=$(merge_refused_result)"\nmerge_refused_message`,
+      'true',
+    );
+    expect(out).toContain('RESULT=would_merge');
+    expect(out).toContain('nothing was merged, and nothing was refused');
+    expect(out).not.toContain('the merge was refused after');
+    // And it does not overstate what a shadow run establishes.
+    expect(out).toContain('does NOT establish that the merge would have succeeded');
+  });
+
+  it('reports a real refusal as `blocked`, unchanged', () => {
+    const out = callInDryRun(
+      `MERGE_ATTEMPTS_MADE=2\nMERGE_ERROR="mergeStateStatus=BLOCKED"\necho "RESULT=$(merge_refused_result)"\nmerge_refused_message`,
+      'false',
+    );
+    expect(out).toContain('RESULT=blocked');
+    expect(out).toContain('the merge was refused after 2 merge attempt(s)');
+    expect(out).toContain('mergeStateStatus=BLOCKED');
   });
 
   it('accepts the usual truthy spellings and defaults to OFF', () => {
     // A config file written by hand will say `1` or `yes` sooner or later, and a
     // silently-ignored dry-run flag is the worst possible way to find that out.
     for (const v of ['true', 'TRUE', '1', 'yes']) {
-      expect(callInDryRun('merge_pr || true', v), `dry-run should be ON for "${v}"`).toMatch(
-        /DRY RUN/,
-      );
+      expect(
+        callInDryRun(`${NO_HOLDS}\nmerge_pr || true`, v),
+        `dry-run should be ON for "${v}"`,
+      ).toMatch(/DRY RUN/);
     }
     // Anything else is off — including an empty value, so an unset variable in a
     // real run can never accidentally disable merging.
-    expect(callInDryRun('merge_pr || true', '')).not.toMatch(/DRY RUN/);
+    expect(callInDryRun(`${NO_HOLDS}\nmerge_pr || true`, '')).not.toMatch(/DRY RUN/);
   });
 });
 

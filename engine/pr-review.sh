@@ -1058,6 +1058,35 @@ MERGE_MAX_ATTEMPTS=${MERGE_MAX_ATTEMPTS:-3}
 MERGE_RETRY_INTERVAL=${MERGE_RETRY_INTERVAL:-15}
 MERGE_RETRY_MERGEABLE_TIMEOUT=${MERGE_RETRY_MERGEABLE_TIMEOUT:-60}
 
+# What to report when merge_pr() declined, and what result to call it.
+#
+# Split out because the two call sites had the sentence inline and BOTH of them
+# said "the merge was refused ... GitHub reported:" — which in shadow mode is a
+# fabrication. Nothing was refused and GitHub was never asked; the run declined
+# to ask. A shadow that reports a refusal GitHub never made is worse than no
+# shadow: the comparison it exists to support then diverges for a reason that is
+# in neither implementation.
+#
+# The HOLD_* globals are populated either way (the holds run in dry-run too), so
+# the honest dry-run sentence sits alongside a real hold when one is in force.
+#
+# $1 is appended verbatim — the converge-loop call site adds its own review note.
+merge_refused_message() {
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    printf '🕶️ DRY RUN — nothing was merged, and nothing was refused.\n\nCI is green and no merge-hold applied. This run stopped before asking GitHub whether it would accept the merge, so it does NOT establish that the merge would have succeeded — only that this reviewer had no reason of its own to withhold it.%s' "${1:-}"
+    return 0
+  fi
+  printf '⚠️ CI passed but the merge was refused after %s merge attempt(s). %s\nSee the run log'"'"'s `Mergeability:` and `MERGE` lines for the full sequence; a re-review will retry.%s' \
+    "$MERGE_ATTEMPTS_MADE" "$(merge_error_block)" "${1:-}"
+}
+
+# `blocked` is a verdict about the PR. In shadow mode there is no such verdict to
+# report, and calling it `blocked` would put a red-looking result on every PR the
+# shadow ever sees — including every PR the real reviewer merged.
+merge_refused_result() {
+  if [ "$CICD_DRY_RUN" = "true" ]; then printf 'would_merge'; else printf 'blocked'; fi
+}
+
 # Renders MERGE_ERROR for the PR comment.
 merge_error_block() {
   if [ -z "$MERGE_ERROR" ]; then
@@ -1087,13 +1116,23 @@ merge_error_oneline() {
 # now a CONDITIONAL fallback, because an unconditional ref delete closes dependent
 # PRs that GitHub's own merge-time auto-delete would have retargeted.
 merge_pr() {
-  # Shadow mode never merges. Belt-and-braces with review_may_apply_fixes(): a
-  # merge is the one action that cannot be walked back, so it is guarded at the
-  # gate AND at the door.
-  if [ "$CICD_DRY_RUN" = "true" ]; then
-    log "DRY RUN: would merge PR #${PR_NUMBER}; not merging."
-    return 1
-  fi
+  # Shadow mode never merges. The dry-run return is NOT at the top of this
+  # function: it sits below the four hold guards, just before wait_for_mergeable.
+  #
+  # The safety property is unchanged — `gh pr merge` is the only mutation here
+  # and it stays unreachable — but a shadow run now reaches the same HOLD verdict
+  # the real reviewer would (label, stacked base, unmet Depends-on, would-orphan).
+  # All four are read-only lookups that set the HOLD_* globals the PR comment
+  # renders. Returning above them made every shadow comment say only "would have
+  # merged", which is the one thing a shadow comparison cannot use: it is not a
+  # verdict, and it is not even true when a hold was in force.
+  #
+  # It stops SHORT of wait_for_mergeable deliberately. That one is read-only too,
+  # but it polls for up to 300s, and a shadow sharing a single runner with the
+  # reviewer it shadows must not spend that on an answer it cannot act on.
+  # Whether GitHub itself would have refused is therefore outside what a shadow
+  # run establishes, and merge_refused_message() says so rather than implying a
+  # refusal that never happened.
   local merged=false
   local blocking_label stacked_base unmet orphans
   local attempt=1 merge_out="" state=""
@@ -1155,6 +1194,14 @@ merge_pr() {
     if orphans="$(would_orphan_children)"; then
       HOLD_ORPHANS="$orphans"
       log "MERGE BLOCKED: PR #${PR_NUMBER} — merging would delete '${PR_HEAD_REF}' and orphan ${orphans}."
+      return 1
+    fi
+
+    # Every hold above has now had its say, and none of them held. Stop here in
+    # shadow mode: everything past this point either polls for minutes or
+    # mutates. See the header of this function for why the guard is HERE.
+    if [ "$CICD_DRY_RUN" = "true" ]; then
+      log "DRY RUN: no hold is in force on PR #${PR_NUMBER}; not merging, and not polling mergeability."
       return 1
     fi
 
@@ -2836,8 +2883,7 @@ main() {
         merge_sha="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null || echo "$HEAD_SHA")"
         finish "✅ Previous auto-review fixes passed CI. PR merged." "merged" 0 "$merge_sha"
       else
-        finish "⚠️ CI passed but the merge was refused after ${MERGE_ATTEMPTS_MADE} merge attempt(s). $(merge_error_block)
-See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a re-review will retry." "blocked" 0
+        finish "$(merge_refused_message)" "$(merge_refused_result)" 0
       fi
     elif [ "$ci_exit" -eq 1 ]; then
       finish "$(failed_ci_message "after the auto-review fixes")" "blocked" 0
@@ -3248,8 +3294,7 @@ $(cat "$DROPPED_FIXES_FILE")"
       merge_sha="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null || echo "$push_sha")"
       finish "✅ Review complete, CI green. PR merged.${review_note}" "merged" "$iterations" "$merge_sha"
     else
-      finish "⚠️ CI passed but the merge was refused after ${MERGE_ATTEMPTS_MADE} merge attempt(s). $(merge_error_block)
-See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a re-review will retry.${review_note}" "blocked" "$iterations"
+      finish "$(merge_refused_message "$review_note")" "$(merge_refused_result)" "$iterations"
     fi
   elif [ "$ci_exit" -eq 1 ]; then
     finish "$(failed_ci_message)${review_note}" "blocked" "$iterations"
