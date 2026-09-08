@@ -5,8 +5,11 @@ description: >-
 inputs:
   needs:
     description: >-
-      `${{ toJSON(needs) }}` from the gate job. Must be passed explicitly —
-      an action cannot read its caller's needs context.
+      The caller's needs context, serialised with toJSON. Must be passed
+      explicitly: an action cannot read its caller's needs. Do NOT write the
+      expression literally in this description — GitHub evaluates expressions in
+      description text too, and `needs` is not a context an action can resolve, so
+      it fails the manifest at load time before any step runs.
     required: true
   required-jobs:
     description: >-

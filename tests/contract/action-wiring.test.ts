@@ -61,6 +61,35 @@ describe('composite actions', () => {
     });
   }
 
+  for (const name of actions) {
+    it(`${name}: no expressions in description text`, () => {
+      // GitHub evaluates ${{ }} inside `description:` too. An expression naming a
+      // context an action cannot resolve — `needs`, `matrix`, `secrets` — fails the
+      // ENTIRE manifest at load time with "Unrecognized named-value", before any
+      // step runs, in the consumer's CI rather than here.
+      //
+      // This is not hypothetical: ci-gate shipped with `${{ toJSON(needs) }}` in an
+      // input description as documentation, and every consuming job died on
+      // "Failed to load action.yml". The wiring checks above all passed, because
+      // the file existed and the inputs were declared.
+      const yml = readFileSync(path.join(actionsDir, name, 'action.yml'), 'utf8');
+      const meta = yml.split(/^runs:/m)[0];
+      // `outputs.<id>.value:` is the ONE place an expression legitimately belongs
+      // in the metadata section — `steps` IS resolvable there, and an action's
+      // outputs cannot be wired any other way. Everything else in this section is
+      // prose, where an expression is either dead text or a manifest-breaking
+      // reference to a context the action cannot see.
+      const offenders = meta
+        .split('\n')
+        .map((line, i) => ({ n: i + 1, line }))
+        .filter(({ line }) => /\$\{\{/.test(line) && !/^\s*value:/.test(line));
+      expect(
+        offenders.map(({ n, line }) => `  ${n}: ${line.trim()}`),
+        `${name}/action.yml has an expression in its metadata section`,
+      ).toEqual([]);
+    });
+  }
+
   it('at least one action actually runs the engine', () => {
     // The per-action check above tolerates an action that runs nothing from
     // engine/ (resolve-gh). This makes sure they are not ALL like that, which
