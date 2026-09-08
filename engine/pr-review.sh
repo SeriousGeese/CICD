@@ -1662,9 +1662,14 @@ normalize_versions() {
 #
 # The lockfile list is DATA, not package-manager machinery: the engine must know
 # which files it refuses to let a model hand-edit, but never how to run an
-# installer. It covers all three ecosystems in the fleet — DnD is npm, PromptCI
-# and promptci-cloud are pnpm, and only npm's name was here before, so the two
-# pnpm repos' lockfiles were entirely unguarded.
+# installer.
+#
+# It has to cover every ecosystem in the fleet because ONE engine now serves all
+# three repos. The seed came from DnD, which is npm-only and correctly named just
+# `package-lock.json`; that list would silently stop guarding pnpm-lock.yaml the
+# moment PromptCI or promptci-cloud adopted it. (Both of those repos already guard
+# their own lockfile locally — this is a consequence of sharing an engine, not a
+# pre-existing hole in either of them.)
 LOCKFILE_NAMES='package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lockb'
 
 is_version_pin_change() {

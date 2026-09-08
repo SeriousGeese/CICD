@@ -66,9 +66,11 @@ describe('engine carries no package-manager knowledge', () => {
   }
 
   it('refuses model edits to every lockfile in the fleet, not just the npm one', () => {
-    // DnD is npm; PromptCI and promptci-cloud are pnpm. Before consolidation only
-    // `package-lock.json` was named here, so both pnpm repos' lockfiles could be
-    // hand-edited by a model and applied.
+    // One engine serves three repos across two ecosystems. The seed came from
+    // DnD, which is npm-only and correctly listed just `package-lock.json` — a
+    // list that would silently stop guarding pnpm-lock.yaml the moment either
+    // pnpm repo adopted this engine. Both of them already guard their own
+    // lockfile locally; this is a consequence of sharing, not a hole in either.
     for (const lock of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']) {
       expect(source, `${lock} must be in LOCKFILE_NAMES`).toContain(lock);
     }
