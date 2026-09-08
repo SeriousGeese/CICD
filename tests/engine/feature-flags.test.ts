@@ -108,6 +108,35 @@ const DISPATCHES = [
   { fn: 'approve_held_runs', flag: 'CICD_FEATURE_APPROVE_HELD_RUNS' },
 ];
 
+describe('a disabled feature is inert, not permissive', () => {
+  it('approve_held_runs reports NOTHING APPROVED when disabled', () => {
+    // Its return value answers "did I approve something", not "did I succeed" —
+    // the live function returns 1 when it found nothing. Its only caller is
+    //     if approve_held_runs "$sha"; then zero_checks_elapsed=0; fi
+    // so a disabled version returning 0 resets the zero-checks grace on EVERY
+    // poll, and the fail-closed that stops a checkless SHA merging can never
+    // fire. The first version of this flag got exactly that backwards.
+    const out = run(
+      `if approve_held_runs abc123; then echo APPROVED_SOMETHING; else echo NOTHING_APPROVED; fi`,
+      { CICD_FEATURE_APPROVE_HELD_RUNS: 'false' },
+    );
+    expect(out).toContain('NOTHING_APPROVED');
+    expect(out).not.toContain('GH_CALLED');
+  });
+
+  it('the zero-checks grace is not reset by a disabled approve_held_runs', () => {
+    // The consequence, asserted directly rather than inferred from the return
+    // code: drive the caller's own idiom and confirm the grace survives.
+    const out = run(
+      `zero_checks_elapsed=99
+if approve_held_runs abc123; then zero_checks_elapsed=0; fi
+echo "grace=\${zero_checks_elapsed}"`,
+      { CICD_FEATURE_APPROVE_HELD_RUNS: 'false' },
+    );
+    expect(out).toContain('grace=99');
+  });
+});
+
 describe('dispatch actions do nothing when their flag is off', () => {
   for (const { fn, flag } of DISPATCHES) {
     it(`${fn} makes no API call when ${flag}=false`, () => {
