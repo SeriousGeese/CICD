@@ -128,20 +128,39 @@ python_path() {
 PROMPT_FILE="${SYSTEM_PROMPT_FILE:-${SCRIPT_DIR}/review-prompt.md}"
 MAX_ITERATIONS=3
 MAX_DIFF_LINES=5000
-POLL_INTERVAL=30  # seconds between CI status checks
-POLL_TIMEOUT=1800  # 30 min total timeout for CI
-# ci.yml excludes **.md, docs/**, and content/** via paths-ignore, so a
-# docs/content-only PR never gets a single check-run registered for its SHA —
-# not "still starting," just genuinely nothing to wait for. GitHub creates a
-# check-run entry within seconds of a workflow actually being triggered, so
-# if none exists after this grace period, no CI applies to this SHA at all.
-ZERO_CHECKS_GRACE=120  # seconds to wait for any check-run to appear before concluding none will
+# `: "${VAR:=default}"`, not a bare assignment, for all four poll clocks.
+#
+# That is a testability investment, not a style choice: every timing case in
+# tests/engine/wait-for-ci.test.ts drives the real loop over compressed
+# timescales, and a bare assignment makes that impossible — the suite would have
+# to wait out a 30-minute timeout or reimplement the loop it is meant to be
+# testing. Production behaviour is unchanged; the defaults are the old values.
+: "${POLL_INTERVAL:=30}"    # seconds between CI status checks
+: "${POLL_TIMEOUT:=1800}"   # 30 min total timeout for CI
+
+# GitHub creates a check-run within seconds of a workflow actually triggering, so
+# if none exists after this grace, none is coming for this SHA.
+#
+# This USED to also excuse a docs-only PR whose paths-ignore suppressed every
+# workflow — the return-3 grace. That is gone: every consumer now publishes an
+# aggregate context on every PR (DnD via ci-docs-shim.yml), so zero checks is a
+# fault rather than a legitimate state, and this grace only absorbs the startup
+# window.
+: "${ZERO_CHECKS_GRACE:=120}"
+
+# A SEPARATE, LONGER clock for "a required context has not registered yet", and
+# separate on purpose. Some checks exist while a required one is still queueing,
+# so the zero-checks grace has already been satisfied and would never re-arm —
+# wiring both to one constant means the required-context wait effectively does not
+# exist. The test asserts the two are distinct by driving them apart.
+: "${MISSING_REQUIRED_GRACE:=300}"
 # Checks that FINISHED without a verdict on the last poll, rendered as
 # `<name> [conclusion=<c>]; …` (DnD-7aqcv). wait_for_ci sets it alongside its
 # return-5 verdict so the PR comment can name them; unresolved_ci_message() is
 # the only reader. A global rather than a return value because bash functions
 # return an exit status, and this one already uses every code it has.
 LAST_UNRESOLVED_CHECKS=""
+LAST_MISSING_REQUIRED=""   # return 6 — `<context>, <context>`
 # The checks that were RED on the poll wait_for_ci blocked on, same rendering
 # and same reason (DnD-85jir): the PR comment names them instead of reporting a
 # bare count nobody can act on.
@@ -2179,44 +2198,54 @@ check_ci_status() {
   echo "$parsed"
 }
 
+# Poll until this SHA has a CI verdict, or until we can say why it never will.
+#
+# Structure and return codes come from promptci-cloud, which is the tested one —
+# tests/engine/wait-for-ci.graft-spec.test.ts is its suite, ported verbatim. The
+# DnD-derived version this replaces had no concept of a REQUIRED context: it read
+# ci-status.jq's `required_missing` zero times, so the required set influenced
+# nothing but the skipped-check rule.
+#
+# WHAT WAS DELIBERATELY DROPPED: return 3, the "docs-only grace". It let a SHA with
+# zero check runs merge when the PR touched no CI-relevant path. Cloud can fail
+# closed instead because its `gate` context ALWAYS registers; DnD can now too,
+# since it grew an aggregate gate plus ci-docs-shim.yml. A grace that exists to
+# excuse a missing verdict is a liability once a verdict is guaranteed.
+#
+# WHAT WAS DELIBERATELY KEPT: the approve_held_runs() call each poll. It is the one
+# piece of DnD-only logic in here and Cloud has no equivalent, so taking Cloud's
+# body wholesale would have silently dropped it — a GITHUB_TOKEN push parks runs as
+# action_required, and without this they are never approved and the grace expires
+# into a fail-closed naming the wrong cause.
 wait_for_ci() {
   local sha="$1"
   # "true" when $sha reached the branch via this pipeline's own GITHUB_TOKEN
-  # push. GitHub fires NO workflows for GITHUB_TOKEN events — the same
-  # suppression dispatch_close_beads() exists for — so a bot-pushed SHA never
-  # gets pull_request-triggered CI on its own. For those SHAs this function
+  # push. GitHub fires NO workflows for GITHUB_TOKEN events, so a bot-pushed SHA
+  # never gets pull_request-triggered CI on its own. For those SHAs this function
   # dispatches ci.yml explicitly, and "zero check runs" means the dispatch
-  # failed: fail closed (return 4), never "no CI applies". Before this flag
-  # existed, every base-sync push produced a checkless SHA that the grace
-  # period below waved through as docs-only — ~30 code PRs merged with zero
-  # CI on 2026-07-20 (DnD-4drs9).
-  #
-  # Nuance found later (DnD-k06w2): "fires no workflows" is about the JOBS. The
-  # runs are still CREATED, parked as action_required awaiting approval — which
-  # is why approve_held_runs() is called each poll below. It is the reason a
-  # checkless bot-pushed SHA is not always a failed dispatch.
+  # failed: fail closed (return 4), never "no CI applies".
   local bot_pushed="${2:-false}"
-  # "true" when the PR touches a path ci.yml builds/tests (see
-  # pr_touches_ci_paths). Gates the docs-only shortcut below: a CI-relevant PR
-  # with zero check runs is CI-not-registered-yet, never docs-only, so it must
-  # never take the return-3 fast path both callers merge on (DnD-7k9o0).
-  local ci_relevant="${3:-false}"
   local waited=0
   local zero_checks_elapsed=0
+  local missing_required_elapsed=0
   local ci_dispatched=false
-  # Human-readable list of the non-terminal checks from the most recent poll,
-  # named in every waiting/timeout line (DnD-78zah). Declared here so the
-  # post-loop timeout below reads a defined value even if the loop never ran.
+  # Which checks are keeping this poll alive, with their conclusions. NOT a
+  # nicety: "CI: 17 checks, waiting" tells you a count and nothing else, so a
+  # run that timed out had to be reconstructed from the API by hand. Declared
+  # here (bash `local` is function-scoped) so the post-loop timeout line can
+  # still read the last poll's value even if the loop never ran.
   local pending="none"
 
   while [ "$waited" -lt "$POLL_TIMEOUT" ]; do
-    # Before reading check runs, clear any workflow run GitHub parked for
-    # manual approval on this SHA (DnD-k06w2). A held run contributes NO check
-    # run, so without this the poll below cannot distinguish it from CI that
-    # simply has not started, and the grace expires into a fail-closed block
-    # that names the wrong cause. Runs on every iteration, not just the first:
-    # the hold has been seen appearing partway through a review, and a run
-    # approved here needs the grace restarted so it can register its check.
+    # A GITHUB_TOKEN push fires no workflow JOBS, but the runs are still created and
+    # parked as action_required awaiting approval. Approving them here is what makes
+    # a checkless bot-pushed SHA recoverable rather than a fail-closed block naming
+    # the wrong cause. Every iteration, not just the first: the hold has been seen
+    # appearing partway through a review, and a run approved here needs the grace
+    # restarted so it can register its check.
+    #
+    # Returns 0 ONLY when it actually approved something — a disabled feature
+    # returns 1, so the grace is not silently reset in a repo that switched it off.
     if approve_held_runs "$sha"; then
       zero_checks_elapsed=0
     fi
@@ -2224,106 +2253,76 @@ wait_for_ci() {
     local raw_status
     raw_status="$(check_ci_status "$sha")"
 
-    # Convert JSON nulls to safe defaults using jq
-    local all_completed all_success total failures api_failed unresolved unresolved_names
+    local all_completed all_success total failures api_failed
+    local unresolved unresolved_names required_missing required_missing_names
     all_completed="$(echo "$raw_status" | jq -r 'if .all_completed then "true" else "false" end' 2>/dev/null || echo "false")"
     all_success="$(echo "$raw_status" | jq -r 'if .all_success then "true" else "false" end' 2>/dev/null || echo "false")"
     total="$(echo "$raw_status" | jq -r 'if .total then .total else 0 end' 2>/dev/null || echo "0")"
     failures="$(echo "$raw_status" | jq -r 'if .failures then .failures else 0 end' 2>/dev/null || echo "0")"
     api_failed="$(echo "$raw_status" | jq -r 'if .api_failed then "true" else "false" end' 2>/dev/null || echo "false")"
-    # Which checks are keeping this poll alive, with their conclusions. NOT a
-    # nicety: the old line said only "CI: 17 checks, waiting", so a run that
-    # timed out told you a count and nothing else, and the 11-green/5-cancelled/
-    # 1-auto-review split behind PR #2690 had to be reconstructed by hand from
-    # the API days later. `pending` is scoped to the function (bash `local` is
-    # function-scoped, not block-scoped), so the post-loop timeout line below
-    # can still read the last poll's value.
     pending="$(echo "$raw_status" | jq -r 'if .pending then .pending else "" end' 2>/dev/null || echo "")"
     [ -n "$pending" ] || pending="none"
-    # Checks that FINISHED without a verdict (DnD-7aqcv) — the subset of
-    # `pending` that will never move again, and the reason for the return-5
-    # branch below.
+    # Checks that FINISHED without a verdict — the subset of `pending` that will
+    # never move again, and the reason for the return-5 branch below.
     unresolved="$(echo "$raw_status" | jq -r 'if .unresolved then .unresolved else 0 end' 2>/dev/null || echo "0")"
     unresolved_names="$(echo "$raw_status" | jq -r 'if .unresolved_names then .unresolved_names else "" end' 2>/dev/null || echo "")"
     [ -n "$unresolved_names" ] || unresolved_names="none"
+    # Required contexts with no check run of that name at all — return 6.
+    required_missing="$(echo "$raw_status" | jq -c 'if .required_missing then .required_missing else [] end' 2>/dev/null || echo '[]')"
+    [ -n "$required_missing" ] || required_missing='[]'
+    required_missing_names="$(printf '%s' "$required_missing" | jq -r 'join(", ")' 2>/dev/null || echo "")"
+    [ -n "$required_missing_names" ] || required_missing_names="none"
 
     if [ "$api_failed" = "true" ]; then
       # "Could not ask" is not "zero checks": don't dispatch off it and don't
-      # let it accumulate toward the zero-checks grace. Keep polling; if the
-      # API never recovers the loop exits at POLL_TIMEOUT → blocked.
+      # let it accumulate toward the zero-checks grace, or a minute of GitHub
+      # flakiness reads as a terminal verdict. Keep polling; if the API never
+      # recovers the loop exits at POLL_TIMEOUT → blocked.
       log "  CI: check-runs lookup failing — not counting toward the zero-checks grace (${waited}s elapsed)"
     elif [ "$total" -eq 0 ]; then
-      # Zero check runs has two safe meanings and one dangerous one:
-      #   • bot_pushed SHA — GITHUB_TOKEN pushes fire no CI, so we must
-      #     dispatch ci.yml explicitly and fail closed if it never appears.
-      #   • ci_relevant PR — the PR touches a path ci.yml builds/tests, so CI
-      #     DOES apply; zero checks means "not registered yet" (a 2nd commit
-      #     pushed as the review started, or a run cancelled by ci.yml's
-      #     cancel-in-progress). Dispatch to heal the cancelled-run case, then
-      #     fail closed — NEVER treat a code PR as docs-only (DnD-7k9o0).
-      #   • neither — a genuinely docs/content-only PR ci.yml path-filters;
-      #     zero checks is terminal and safe (return 3, the docs-only grace).
-      if { [ "$bot_pushed" = "true" ] || [ "$ci_relevant" = "true" ]; } && [ "$ci_dispatched" = "false" ]; then
+      # Zero check runs is uniformly FAIL CLOSED now (pcic-pa8.3): with `gate`
+      # required, a SHA carrying no check runs can never be merged by
+      # `gh pr merge`, so there is no safe reading of this state. Dispatch
+      # ci.yml once to heal the two recoverable causes (a GITHUB_TOKEN push
+      # fires no workflows; a run cancelled by cancel-in-progress), then block.
+      if [ "$ci_dispatched" = "false" ]; then
         dispatch_ci
-        dispatch_e2e_gate
         ci_dispatched=true
-        # Restart the grace clock so the dispatched run gets the FULL grace
-        # to register its first check run — it had already started ticking
-        # on this same poll, and grace-minus-one-interval is tight enough
-        # for a queued runner to produce a false "CI never started" block.
+        # Restart the grace clock so the dispatched run gets the FULL grace to
+        # register its first check run — it had already started ticking on this
+        # same poll, and grace-minus-one-interval is tight enough for a queued
+        # runner to produce a false "CI never started" block.
         zero_checks_elapsed=0
       fi
       zero_checks_elapsed=$((zero_checks_elapsed + POLL_INTERVAL))
       if [ "$zero_checks_elapsed" -ge "$ZERO_CHECKS_GRACE" ]; then
-        if [ "$bot_pushed" = "true" ]; then
-          log "  CI: no check runs registered after ${zero_checks_elapsed}s on a bot-pushed SHA — the explicit CI dispatch failed or never started, or a workflow run is still held for approval that approve_held_runs() could not clear (see any 'HELD FOR APPROVAL'/'could not approve' line above; DnD-k06w2). Failing closed."
-          return 4
-        fi
-        if [ "$ci_relevant" = "true" ]; then
-          log "  CI: no check runs after ${zero_checks_elapsed}s but the PR touches CI-relevant paths (ci.yml builds/tests them) — CI applies and has not registered (a 2nd commit pushed as the review started, or a run cancelled by ci.yml cancel-in-progress). Failing closed rather than misclassifying a code PR as docs-only."
-          return 4
-        fi
-        log "  CI: no check runs registered after ${zero_checks_elapsed}s — no CI applies to this SHA (e.g. docs/content-only change excluded by ci.yml paths-ignore)"
-        return 3
+        log "  CI: no check runs registered after ${zero_checks_elapsed}s (bot_pushed=${bot_pushed}) — the explicit CI dispatch failed or never started. Failing closed."
+        return 4
       fi
       log "  CI: no check runs yet (waited ${waited}s) — maybe CI hasn't started"
     elif [ "$all_completed" = "true" ] && [ "$all_success" = "true" ]; then
       log "  CI: ALL CHECKS PASSED"
       return 0
-    # FAIL FAST: a failed check is terminal, so there is nothing to learn by waiting
-    # for the slow ones. This used to also require all_completed, which meant a lint
-    # failure at ~40s sat silent behind the full 4-shard Playwright matrix — up to the
-    # 1800s POLL_TIMEOUT — before the bot said a word, and the run then reported
-    # `blocked_infra` (a timeout) rather than the real failure. GitHub cannot express
-    # "don't start e2e.yml when ci.yml's lint failed" (they are separate workflows), and
-    # the e2e shard matrix keeps fail-fast: false on purpose, so this loop is the only
-    # place the wait can actually be cut short.
+    # FAIL FAST: a failed check is terminal, so there is nothing to learn by
+    # waiting for the slow ones. Deliberately NOT gated on all_completed — a
+    # lint failure at ~40s used to sit silent behind the rest of the matrix, up
+    # to the full POLL_TIMEOUT, and the run then reported a timeout rather than
+    # the real failure.
     #
-    # Deliberately NOT extended to cancelled/timed_out checks, which `failures` excludes
-    # (it counts conclusion == "failure" only): a cancel is routinely a superseded run
-    # rather than a verdict, and treating it as one would block PRs that legitimately
-    # carry a cancelled+rerun pair.
+    # Deliberately NOT extended to cancelled/timed_out, which `failures`
+    # excludes (it counts conclusion == "failure" only): a cancel is routinely a
+    # superseded run rather than a verdict — that is the PR #155 shape — and
+    # treating it as one would block PRs that legitimately carry a
+    # cancelled+rerun pair. Those are answered by return 5 below.
     #
-    # DnD-78zah closed the other half of that from the OPPOSITE side, and the two must
-    # stay opposite. A cancel is still never a failure here; instead check_ci_status
-    # now drops a cancelled run that a LATER run of the SAME NAME superseded, so the
-    # cancelled+rerun pair resolves on the rerun's verdict. A cancelled check with no
-    # successor is NOT resolved here either — softening it into a failure verdict is
-    # the regression the test named 'does NOT fail fast on a cancelled check' exists
-    # to catch. It is answered by the terminal-but-unresolved branch below (return 5,
-    # DnD-7aqcv), which reports it as its own thing rather than as a pass, a fail, or
-    # a 30-minute timeout.
-    #
-    # NOT terminal while a RERUN IS IN FLIGHT (DnD-85jir). The one thing this
-    # branch got wrong is that it never reconsidered: a job rerun that turns the
-    # SHA green after this point cannot unblock the merge, because nobody is
-    # looking any more. When the workflow behind a failing check demonstrably
-    # has a LATER run going on this same SHA, the red is provisional — keep
-    # polling and let the rerun publish its own verdict. See
-    # rerunning_workflows_for_suites() for why the workflow-runs API is the only
-    # place that evidence exists at this moment. No rerun in flight means the
-    # old behaviour, unchanged and with no extra API call, so a genuinely red PR
-    # is still reported on the first poll rather than at POLL_TIMEOUT.
+    # NOT terminal while a RERUN IS IN FLIGHT. The one thing fail-fast got wrong
+    # is that it never reconsidered: a rerun that turns the SHA green after this
+    # point cannot unblock the merge, because nobody is looking any more. When
+    # the workflow behind a failing check demonstrably has a LATER run going on
+    # this same SHA, the red is provisional — keep polling and let the rerun
+    # publish its own verdict. No rerun in flight means the old behaviour,
+    # unchanged and with no extra API call, so a genuinely red PR is still
+    # reported on the FIRST poll rather than at POLL_TIMEOUT.
     elif [ "$failures" -gt 0 ]; then
       local failure_names failure_suites rerunning=""
       failure_names="$(echo "$raw_status" | jq -r 'if .failure_names then .failure_names else "" end' 2>/dev/null || echo "")"
@@ -2332,35 +2331,49 @@ wait_for_ci() {
       [ -n "$failure_suites" ] || failure_suites='[]'
       rerunning="$(rerunning_workflows_for_suites "$sha" "$failure_suites")" || rerunning=""
       if [ -n "$rerunning" ]; then
-        log "  CI: ${failures} of ${total} checks currently RED (${failure_names}) — but a later run of ${rerunning} is in flight on this SHA, so a rerun is under way and this red is not terminal. Waiting for it (${waited}s elapsed; DnD-85jir)"
+        log "  CI: ${failures} of ${total} checks currently RED (${failure_names}) — but a later run of ${rerunning} is in flight on this SHA, so a rerun is under way and this red is not terminal. Waiting for it (${waited}s elapsed)"
       else
-        # Named, not just counted (DnD-85jir): "2 of 11 checks" with no names is
-        # what cost PR #2879 a diagnosis cycle.
+        # Named, not just counted: "2 of 11 checks" with no names costs a full
+        # diagnosis cycle.
         LAST_FAILED_CHECKS="$failure_names"
         log "  CI: FAILURES DETECTED ($failures of $total checks: ${failure_names}) — not waiting for the checks still running"
         return 1
       fi
-    # TERMINAL BUT UNRESOLVED — the third verdict (DnD-7aqcv). Every check has
-    # finished, none failed, and at least one concluded with something that is
-    # neither a pass nor a fail (typically `cancelled` with no re-run). There is
-    # nothing left to wait FOR: check_ci_status already reduced to the latest run
-    # per name, so no successor is coming, and this SHA will look identical in
-    # 29 more minutes.
+    # REQUIRED CONTEXT NEVER REGISTERED — return 6. Every check that exists has
+    # finished and none failed, but a context the ruleset requires has no check
+    # run of that name at all. GitHub does not read "absent" as "passed", so
+    # `gh pr merge` would be refused; reporting it here names the cause instead
+    # of failing at the merge call with "the base branch policy prohibits the
+    # merge".
     #
-    # This is deliberately a THIRD verdict rather than a softening of either
-    # neighbour, and both neighbours are pinned by tests that must stay green:
-    #   * it is NOT a pass — a cancelled-only SHA must never merge (DnD-78zah
-    #     AC 2, test "does NOT report a cancelled-only SHA as passing");
-    #   * it is NOT a failure — `failures` still counts conclusion == "failure"
-    #     only, so the fail-fast branch above is untouched (PR #2691, test
-    #     "does NOT fail fast on a cancelled check").
-    # What changes is only WHEN the block is reported: on the first poll with the
-    # cause named, instead of after the full POLL_TIMEOUT as `blocked_infra`.
+    # BEHIND THE SAME GRACE as zero-checks, and that is load-bearing rather than
+    # caution: `gate` has `needs: [ci, e2e, audit]`, and a check run appears only
+    # when its job STARTS. So there is a genuine window — every check green,
+    # `gate` queued and not yet registered — that is indistinguishable from the
+    # real fault by a single poll. Only a context still missing after the grace
+    # is terminal.
+    elif [ "$all_completed" = "true" ] && [ "$required_missing" != "[]" ]; then
+      missing_required_elapsed=$((missing_required_elapsed + POLL_INTERVAL))
+      if [ "$missing_required_elapsed" -ge "$MISSING_REQUIRED_GRACE" ]; then
+        LAST_MISSING_REQUIRED="$required_missing_names"
+        log "  CI: REQUIRED CONTEXT MISSING — all ${total} checks finished and none failed, but no check run ever registered for: ${required_missing_names}"
+        return 6
+      fi
+      log "  CI: all ${total} checks completed but required context(s) not registered yet: ${required_missing_names} — waiting ${missing_required_elapsed}s/${MISSING_REQUIRED_GRACE}s for them to start"
+    # TERMINAL BUT UNRESOLVED — return 5. Every check finished, none failed, and
+    # at least one concluded with something that is neither a pass nor a fail
+    # (typically `cancelled` with no re-run, or `skipped` on a REQUIRED context).
+    # There is nothing left to wait FOR: check_ci_status already reduced to the
+    # latest run per name and resolved anything a later successful run of the
+    # same workflow superseded, so no successor is coming and this SHA will look
+    # identical in 29 more minutes.
     #
-    # A `skipped` check lands here too, which does NOT relax the standing rule
-    # against narrowing a workflow with a job-level `if:` (DnD-t03ne): such a PR
-    # is still blocked and still needs the job removed or made unconditional. It
-    # now costs one poll to say so rather than 30 minutes.
+    # A third verdict, not a softening of either neighbour:
+    #   * NOT a pass — a cancelled-only SHA must never merge;
+    #   * NOT a failure — `failures` still counts conclusion == "failure" only,
+    #     so the fail-fast branch above is untouched.
+    # What changes is only WHEN the block is reported: on the first poll with
+    # the cause named, instead of after the full POLL_TIMEOUT.
     elif [ "$all_completed" = "true" ] && [ "$unresolved" -gt 0 ]; then
       LAST_UNRESOLVED_CHECKS="$unresolved_names"
       log "  CI: TERMINAL BUT UNRESOLVED — all ${total} checks finished, none failed, but ${unresolved} reached no verdict: ${unresolved_names}"
@@ -2369,7 +2382,6 @@ wait_for_ci() {
       log "  CI: ${total} checks, waiting (${waited}s elapsed) — still non-terminal: ${pending}"
     fi
 
-    # Check if next interval would exceed timeout
     if [ $((waited + POLL_INTERVAL)) -ge "$POLL_TIMEOUT" ]; then
       log "  CI: TIMEOUT after ${POLL_TIMEOUT}s — still non-terminal: ${pending}"
       return 2
@@ -2401,6 +2413,19 @@ ${names}
 Not merging: a cancelled or skipped check is not a passing check. Nothing is coming that would change this — the poller already resolves a cancelled run against any later run of the same name, and there is no later run — so this is reported now rather than after ${POLL_TIMEOUT}s of polling.
 
 **To clear it:** re-run those checks (a fresh check run of the same name replaces this one), or push a commit. If a check concluded \`skipped\`, the job was narrowed with a job-level \`if:\` — remove it (see the DnD-t03ne note in .github/workflows/e2e.yml)."
+}
+
+missing_required_message() {
+  local names="${LAST_MISSING_REQUIRED:-none}"
+  printf '%s' "🛑 A **required status check never registered** on this SHA — not merging:
+
+${names}
+
+Every check that did run finished and none failed, but GitHub does not treat an absent required context as a passing one, so \`gh pr merge\` would be refused by the base branch policy.
+
+**Most likely** this branch predates the \`gate\` job in \`.github/workflows/ci.yml\`: the dispatch runs the branch's OWN copy of ci.yml, which cannot publish a job it does not contain. Merge \`main\` into this branch and re-review.
+
+**Otherwise** the \`main\` ruleset names a context that no workflow in this repo publishes at all — check the required-status-checks rule against the job ids in \`.github/workflows/\`, and see \`tests/repo/pr-review-required-checks.test.ts\`."
 }
 
 # The PR comment for wait_for_ci's return 1, shared by both call sites so they
@@ -2798,16 +2823,18 @@ main() {
     local ci_exit=0
     # A bot commit at the branch tip was pushed with GITHUB_TOKEN (that is the
     # only way one lands there), so its CI never fires on its own — pass
-    # bot_pushed=true so wait_for_ci dispatches it and fails closed on zero
-    # checks instead of treating them as docs-only.
-    wait_for_ci "$live_tip" true "$ci_relevant" || ci_exit=$?
-    if [ "$ci_exit" -eq 0 ] || [ "$ci_exit" -eq 3 ]; then
-      local ci_note=""
-      [ "$ci_exit" -eq 3 ] && ci_note=" (no CI checks apply to this change)"
-      log "CI all green${ci_note} — merging PR #${PR_NUMBER}"
+    # bot_pushed=true so wait_for_ci dispatches it and fails closed on zero checks.
+    #
+    # No third argument any more: the docs-only grace (return 3) is gone. It
+    # excused a missing verdict, which is only safe when a verdict is not
+    # guaranteed — and every consumer now publishes an aggregate context on every
+    # PR, DnD included since it grew ci-docs-shim.yml.
+    wait_for_ci "$live_tip" true || ci_exit=$?
+    if [ "$ci_exit" -eq 0 ]; then
+      log "CI all green — merging PR #${PR_NUMBER}"
       if merge_pr; then
         merge_sha="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null || echo "$HEAD_SHA")"
-        finish "✅ Previous auto-review fixes passed CI${ci_note}. PR merged." "merged" 0 "$merge_sha"
+        finish "✅ Previous auto-review fixes passed CI. PR merged." "merged" 0 "$merge_sha"
       else
         finish "⚠️ CI passed but the merge was refused after ${MERGE_ATTEMPTS_MADE} merge attempt(s). $(merge_error_block)
 See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a re-review will retry." "blocked" 0
@@ -2818,6 +2845,8 @@ See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a
       finish "🚨 CI never started for the bot-pushed SHA even after an explicit workflow dispatch — failing closed, not merging. Most likely cause: this branch was cut before ci.yml gained its workflow_dispatch trigger, so the dispatch 422s — merge main into the branch and re-review. Otherwise check the Actions runners, then re-run this review." "blocked_infra" 0
     elif [ "$ci_exit" -eq 5 ]; then
       finish "$(unresolved_ci_message)" "blocked" 0
+    elif [ "$ci_exit" -eq 6 ]; then
+      finish "$(missing_required_message)" "blocked" 0
     else
       finish "⏰ CI polling timed out after ${POLL_TIMEOUT}s. Manual check recommended." "blocked_infra" 0
     fi
@@ -3203,23 +3232,21 @@ $(cat "$DROPPED_FIXES_FILE")"
 
   log "Checking CI status..."
   local ci_exit=0
-  # poll_bot_pushed means $push_sha did not come from the author's own push —
-  # its CI never fires naturally, so wait_for_ci must dispatch it and treat
-  # persistent zero checks as a fault, not a docs-only PR. Only the author's
-  # own event SHA keeps the docs-only zero-checks grace.
-  wait_for_ci "$push_sha" "$poll_bot_pushed" "$ci_relevant" || ci_exit=$?
-  if [ "$ci_exit" -eq 0 ] || [ "$ci_exit" -eq 3 ]; then
+  # poll_bot_pushed means $push_sha did not come from the author's own push — its
+  # CI never fires naturally, so wait_for_ci must dispatch it. Persistent zero
+  # checks are now a fault on EITHER path: the docs-only grace that used to excuse
+  # them for an author's own SHA is gone with return 3.
+  wait_for_ci "$push_sha" "$poll_bot_pushed" || ci_exit=$?
+  if [ "$ci_exit" -eq 0 ]; then
     if [ "$qg_last" = "fail" ]; then
       # Gates failed locally but CI is green on the un-fixed SHA — the LLM's
       # fixes were the problem, not the PR. Merge the PR as-is.
       log "Local converge failed but CI is green on PR head — merging original code"
     fi
-    local ci_note=""
-    [ "$ci_exit" -eq 3 ] && ci_note=" (no CI checks apply to this change — e.g. docs/content-only)"
-    log "CI all green${ci_note} — merging PR #${PR_NUMBER}"
+    log "CI all green — merging PR #${PR_NUMBER}"
     if merge_pr; then
       merge_sha="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json mergeCommit --jq '.mergeCommit.oid' 2>/dev/null || echo "$push_sha")"
-      finish "✅ Review complete, CI green${ci_note}. PR merged.${review_note}" "merged" "$iterations" "$merge_sha"
+      finish "✅ Review complete, CI green. PR merged.${review_note}" "merged" "$iterations" "$merge_sha"
     else
       finish "⚠️ CI passed but the merge was refused after ${MERGE_ATTEMPTS_MADE} merge attempt(s). $(merge_error_block)
 See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a re-review will retry.${review_note}" "blocked" "$iterations"
@@ -3230,6 +3257,8 @@ See the run log's \`Mergeability:\` and \`MERGE\` lines for the full sequence; a
     finish "🚨 CI never started for the bot-pushed SHA even after an explicit workflow dispatch — failing closed, not merging. Most likely cause: this branch was cut before ci.yml gained its workflow_dispatch trigger, so the dispatch 422s — merge main into the branch and re-review. Otherwise check the Actions runners, then re-run this review.${review_note}" "blocked_infra" "$iterations"
   elif [ "$ci_exit" -eq 5 ]; then
     finish "$(unresolved_ci_message)${review_note}" "blocked" "$iterations"
+  elif [ "$ci_exit" -eq 6 ]; then
+    finish "$(missing_required_message)${review_note}" "blocked" "$iterations"
   else
     finish "⏰ CI check polling timed out after ${POLL_TIMEOUT}s. Manual check recommended.${review_note}" "blocked_infra" "$iterations"
   fi
