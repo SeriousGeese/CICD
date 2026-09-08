@@ -213,12 +213,58 @@ describe('consumer profiles', () => {
     });
   }
 
-  it('every repo without an aggregate gate job runs strict-skipped', () => {
-    // The one cross-profile invariant that actually protects a merge gate: the
-    // precise skipped-check rule leans on required_contexts(), which fails OPEN.
-    // Only promptci-cloud has a `gate` job today.
-    expect(profile('dnd').CICD_STRICT_SKIPPED).toBe('true');
-    expect(profile('promptci').CICD_STRICT_SKIPPED).toBe('true');
-    expect(profile('cloud').CICD_STRICT_SKIPPED).toBe('false');
+  it('every profile states CICD_STRICT_SKIPPED explicitly', () => {
+    // This replaces an assertion that REQUIRED the wrong value: it demanded
+    // strict=true for "every repo without an aggregate gate job", i.e. for
+    // PromptCI and DnD. Following it breaks PromptCI outright — auto-merge.yml's
+    // job carries a job-level `if:` and so reports SKIPPED on every
+    // human-authored PR, which strict mode waits out on every review, every
+    // time. A test that mandates a production-breaking value is worse than no
+    // test, because it also blocks the fix.
+    //
+    // The real rule cannot be checked from here. Strict is safe only when NO
+    // check in the consumer repo ever legitimately skips, and non-strict is safe
+    // only when the REQUIRED context cannot itself skip. Both are facts about
+    // another repo's workflows. So what IS enforceable is enforced: the value is
+    // stated rather than defaulted, and the profile file carries the per-repo
+    // reason next to it.
+    //
+    // All three currently answer `false`, by three different routes — which is
+    // the clearest evidence available that the aggregate-gate shorthand never
+    // described the actual rule.
+    for (const name of names) {
+      const value = profile(name).CICD_STRICT_SKIPPED;
+      expect(value, `${name}.env must state CICD_STRICT_SKIPPED`).toMatch(/^(true|false)$/);
+    }
+  });
+
+  it('every profile explains its CICD_STRICT_SKIPPED choice in the file', () => {
+    // The value alone is not reviewable: `false` is correct for all three repos
+    // today and catastrophic for a repo whose required context can skip. The
+    // reason has to travel with it, because the person who changes it next will
+    // be reading this file and not this test.
+    for (const name of names) {
+      const text = readFileSync(path.join(profilesDir, `${name}.env`), 'utf8');
+      const idx = text.indexOf('CICD_STRICT_SKIPPED=');
+      const preamble = text.slice(0, idx);
+      const comment = preamble.slice(preamble.lastIndexOf('\n\n'));
+      expect(
+        comment.split('\n').filter((l) => l.trim().startsWith('#')).length,
+        `${name}.env: CICD_STRICT_SKIPPED needs a comment saying why`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it('each profile records that it mirrors the consumer repo, not the other way round', () => {
+    // Nothing can enforce the mirror from here — CICD cannot read a consumer
+    // repo. An unenforceable rule decays unless it is written where it will be
+    // read, so it is written in each profile and asserted to still be there. The
+    // failure it guards is quiet: a consumer changes .cicd/config.env, this file
+    // does not, and every profile-matrixed test below then validates a
+    // configuration nobody runs.
+    for (const name of names) {
+      const text = readFileSync(path.join(profilesDir, `${name}.env`), 'utf8');
+      expect(text, `${name}.env`).toMatch(/MIRRORS (THE REPO'S OWN|WHAT DnD WILL SET IN)/);
+    }
   });
 });
