@@ -36,13 +36,23 @@ inputs:
   strict-skipped:
     description: >-
       Treat ANY skipped check as unresolved, not just a skipped REQUIRED one.
-      Set true for a repo WITHOUT an aggregate `gate` job. The precise rule
-      depends on required_contexts(), which FAILS OPEN — so with a wrong or empty
-      required set every skipped check reads as a pass and the merge gate quietly
-      stops gating. DEFAULTS TO EMPTY, not 'false': the config loader treats a
-      set name as "the caller passed it explicitly, so it wins", and a non-empty
-      default would make CICD_STRICT_SKIPPED in .cicd/config.env permanently
-      dead. The engine supplies the real default.
+      THE RULE IS NOT "set it when the repo has no aggregate gate job" — an
+      earlier version of this text said that, and following it would hang
+      PromptCI's reviewer on every PR. Strict mode is safe only when NO check in
+      the repo ever legitimately skips, so the question to ask is whether any
+      workflow that publishes a check has a job-level `if:`. PromptCI's
+      auto-merge.yml does, and reports SKIPPED on every human-authored PR, so
+      strict mode would make the reviewer wait out its whole poll budget every
+      time for a check already in its final state. Non-strict is then safe
+      precisely when the REQUIRED context itself cannot skip — a job with no
+      job-level `if:`, or an aggregate gate carrying `if: always()`. Verify that
+      before choosing, because a skipped required check counts as PASSING to
+      GitHub, and the gate stops gating with nothing to show for it. Note also
+      that required_contexts() FAILS OPEN, so a wrong or empty required set has
+      the same effect on its own. DEFAULTS TO EMPTY, not 'false': the config
+      loader treats a set name as "the caller passed it explicitly, so it wins",
+      and a non-empty default would make CICD_STRICT_SKIPPED in
+      .cicd/config.env permanently dead. The engine supplies the real default.
     required: false
     default: ''
   dry-run:
