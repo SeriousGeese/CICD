@@ -400,6 +400,8 @@ default_branch() {
 # the offending base. FAILS CLOSED on a read error, like the label guard: a
 # transient failure costs one deferred merge, and the next run retries.
 stacked_base_violation() {
+  # no violation to report when the repo does not police stacked PRs
+  [ "$CICD_FEATURE_STACKED_PRS" = "true" ] || { return 1; }
   local base rc=0
   base="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json baseRefName \
     --jq .baseRefName 2>/dev/null)" || rc=$?
@@ -431,6 +433,8 @@ stacked_base_violation() {
 # A dependency that is CLOSED but not merged counts as UNMET: it may itself have
 # been orphaned by this very bug, and merging past it would compound the damage.
 unmet_dependencies() {
+  # no Depends-on holds when the repo does not use them
+  [ "$CICD_FEATURE_STACKED_PRS" = "true" ] || { return 1; }
   local body refs num state rc=0 unmet=""
   body="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json body --jq .body 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -485,6 +489,8 @@ unmet_dependencies() {
 # guard above is what prevents one forming — so failing OPEN keeps a read outage
 # from wedging the queue.
 would_orphan_children() {
+  # nothing to orphan when the repo does not police stacked PRs
+  [ "$CICD_FEATURE_STACKED_PRS" = "true" ] || { return 1; }
   local children
   children="$($GH_CLI pr list --repo "$REPO" --state open --base "$PR_HEAD_REF" \
     --json number --jq '[.[].number | "#\(.)"] | join(" ")' 2>/dev/null || true)"
@@ -517,6 +523,8 @@ would_orphan_children() {
 # anyway, because a redundant rebuild is cheap while a missed deploy leaves stage silently
 # stale (DnD-himhn).
 dispatch_stage_deploy() {
+  # the consumer has no deploy-stage workflow
+  [ "$CICD_FEATURE_STAGE_DEPLOY" = "true" ] || { return 0; }
   local dispatch_out
   if [ "$(pr_touches_deploy_paths)" = "false" ]; then
     log "  Skipping stage deploy dispatch: PR #${PR_NUMBER} only touches paths deploy-stage.yml ignores (markdown/docs/.beads)"
@@ -593,6 +601,8 @@ dispatch_ci() {
 # this fires. Nothing in the shim reads the PR's code: only main's e2e.yml paths-ignore
 # and the PR's file list, both of which are what branch protection actually cares about.
 dispatch_e2e_gate() {
+  # the consumer has no e2e workflow to dispatch
+  [ "$CICD_FEATURE_E2E_GATE" = "true" ] || { return 0; }
   local dispatch_out
   if [ "$(pr_touches_e2e_paths)" = "false" ]; then
     if dispatch_out="$($GH_CLI workflow run e2e-docs-shim.yml --repo "$REPO" --ref main -f pr_number="$PR_NUMBER" 2>&1)"; then
@@ -662,6 +672,8 @@ dispatch_e2e_gate() {
 _HELD_RUNS_SEEN=""
 
 approve_held_runs() {
+  # approve nothing; a human approves held runs instead
+  [ "$CICD_FEATURE_APPROVE_HELD_RUNS" = "true" ] || { return 0; }
   local sha="$1"
   local held api_exit=0 err_file
   # stderr goes to its own file rather than into $held: a `2>&1` capture would
@@ -857,6 +869,8 @@ pr_touches_deploy_paths() {
 # tree) leaves the answer "false" and the normal merge path runs — this is an extra
 # guard, not the merge's correctness gate.
 migration_journal_collision() {
+  # no collision: only DnD has a Drizzle migration journal
+  [ "$CICD_FEATURE_MIGRATION_JOURNAL" = "true" ] || { return 1; }
   local journal='src/drizzle/meta/_journal.json'
   local mb
   mb="$(git merge-base HEAD "origin/${PR_BASE_REF}" 2>/dev/null)" || return 1
@@ -886,6 +900,8 @@ resolve_live_tip() {
 # Bead auto-close (DnD-91ye4): bot merges never fire pull_request:closed, so
 # dispatch the close-beads workflow explicitly, same pattern as the deploy.
 dispatch_close_beads() {
+  # the consumer does not use the beads tracker
+  [ "$CICD_FEATURE_BEADS" = "true" ] || { return 0; }
   if $GH_CLI workflow run close-beads.yml --repo "$REPO" --ref main -f pr_number="$PR_NUMBER" 2>&1; then
     log "Dispatched close-beads for PR #${PR_NUMBER}"
   else
@@ -1691,6 +1707,61 @@ is_version_pin_change() {
 # alongside its incumbent reviewer on real PRs and DIFFS THE TWO COMMENTS. Any
 # divergence is found on live traffic, for free, before anything can act on it.
 # Checked here rather than at each call site so there is one place to be sure of.
+# ── Feature flags ──────────────────────────────────────────────────────────
+#
+# The engine is the union of three forks, so behaviours only one repo wants live
+# behind a flag. Set them in the consumer's .cicd/config.env.
+#
+# The defaults are NOT uniform, and the split is deliberate:
+#
+#   HOLD policies default ON. Each one can only ever ADD a reason not to merge,
+#   never remove one, and each is inert unless its condition actually occurs — a
+#   repo that never stacks PRs never trips the stacked-base check. An unwanted
+#   hold is visible and recoverable; a missing one merges something it should not.
+#
+#   DISPATCH actions default OFF. They fire workflow_dispatch at named workflows
+#   (e2e.yml, deploy-stage.yml, close-beads.yml) that a consumer may simply not
+#   have. Firing them blindly is noise at best and a confusing red at worst, and
+#   failing to fire one is recoverable by a human.
+#
+# DnD's profile therefore sets the dispatch flags to 1 and leaves the holds alone,
+# which reproduces the behaviour of the file this engine was seeded from.
+cicd_flag() {
+  # Normalise one flag to true/false. Unset takes the default passed in $2.
+  local name="$1" default="$2" value
+  value="${!name:-$default}"
+  case "$value" in 1|true|TRUE|yes|on) printf 'true' ;; *) printf 'false' ;; esac
+}
+
+CICD_FEATURE_STACKED_PRS="$(cicd_flag CICD_FEATURE_STACKED_PRS true)"
+CICD_FEATURE_MIGRATION_JOURNAL="$(cicd_flag CICD_FEATURE_MIGRATION_JOURNAL true)"
+CICD_FEATURE_APPROVE_HELD_RUNS="$(cicd_flag CICD_FEATURE_APPROVE_HELD_RUNS true)"
+CICD_FEATURE_E2E_GATE="$(cicd_flag CICD_FEATURE_E2E_GATE false)"
+CICD_FEATURE_STAGE_DEPLOY="$(cicd_flag CICD_FEATURE_STAGE_DEPLOY false)"
+CICD_FEATURE_BEADS="$(cicd_flag CICD_FEATURE_BEADS false)"
+CICD_FEATURE_DEPENDABOT_SKIP="$(cicd_flag CICD_FEATURE_DEPENDABOT_SKIP false)"
+
+# Required-check identity. ci-lib.sh reads REQUIRED_CHECKS_FALLBACK; consumers
+# configure CICD_REQUIRED_CHECKS_FALLBACK alongside their other CICD_* settings,
+# so bridge the two rather than making every repo know both names.
+#
+# This matters more than a rename. required_contexts() reads the live ruleset and
+# FAILS OPEN to this fallback — deliberately, because an empty answer is also the
+# shape of a token without ruleset scope. So the fallback is the only thing
+# standing between a ruleset read failing and the reviewer believing NOTHING is
+# required. ci-lib.sh's own default is "gate", which is promptci-cloud's job name
+# and wrong for the other two.
+#
+# Left unset the fallback stays "gate", which in a repo without such a job means
+# required_missing=["gate"] and the poller BLOCKS — the safe direction, but
+# inexplicable to whoever hits it. So say so out loud instead.
+if [ -n "${CICD_REQUIRED_CHECKS_FALLBACK:-}" ]; then
+  REQUIRED_CHECKS_FALLBACK="$CICD_REQUIRED_CHECKS_FALLBACK"
+  export REQUIRED_CHECKS_FALLBACK
+elif [ -z "${REQUIRED_CHECKS_FALLBACK:-}" ]; then
+  annotate warning "CICD_REQUIRED_CHECKS_FALLBACK is not set in .cicd/config.env, so the required-check fallback stays 'gate'. If this repo has no job named 'gate', every review will block on a context that can never register. Set it to this repo's required check name(s)."
+fi
+
 CICD_DRY_RUN="${CICD_DRY_RUN:-false}"
 case "$CICD_DRY_RUN" in 1|true|TRUE|yes) CICD_DRY_RUN=true ;; *) CICD_DRY_RUN=false ;; esac
 
@@ -2560,6 +2631,28 @@ main() {
   local qg_last="none"
   local qg_failure_context=""
   local automerge_eligible=false
+
+  # Dependabot short-circuit (from promptci-cloud). Placed before the
+  # default-branch priming below so a skipped PR costs zero API calls.
+  #
+  # Where a repo lets a separate LLM-free auto-merge.yml own Dependabot PRs,
+  # reviewing them too burns a model call per lockfile bump and risks two merge
+  # authorities racing.
+  #
+  # It also sidesteps a failure worth naming: a Dependabot-triggered run receives
+  # NO Actions secrets, so OPENROUTER_API_KEY arrives empty. PromptCI had this
+  # intent documented and the code missing, and every Dependabot PR there failed
+  # as a result. review_llm's no-credentials path handles that honestly now
+  # regardless, but not paying for the checkout is better still.
+  #
+  # OFF by default: a repo whose reviewer IS the Dependabot merge authority (DnD)
+  # must not silently stop reviewing them.
+  if [ "$CICD_FEATURE_DEPENDABOT_SKIP" = "true" ] \
+     && [ "$PR_AUTHOR" = "dependabot[bot]" ] && ! is_automerge_author; then
+    log "PR #${PR_NUMBER} is a Dependabot PR — the repo's auto-merge workflow owns it. Skipping LLM review."
+    echo "result=skipped_dependabot" >> "$GITHUB_OUTPUT" 2>/dev/null || true
+    exit 0
+  fi
 
   # Prime the default-branch cache with ONE bare call in this (the parent)
   # shell. Every other call site invokes default_branch inside a $( )
