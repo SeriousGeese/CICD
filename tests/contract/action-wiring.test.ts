@@ -102,6 +102,42 @@ describe('composite actions', () => {
     expect(runsEngine.sort()).toEqual(['ci-gate', 'pr-review']);
   });
 
+  it('pr-review reads .cicd/config.env from the BASE commit, never the PR head', () => {
+    // quality-gates.sh is read from the head on purpose — it is product code.
+    // config.env is the opposite: it names the required checks and the feature
+    // flags, i.e. it configures the gate that decides whether THIS PR merges.
+    // Reading it from the head lets a PR author point
+    // CICD_REQUIRED_CHECKS_FALLBACK at a context that does not exist, and
+    // required_contexts() fails OPEN — after which every skipped check counts
+    // as a pass. This asserts the wiring, because the difference between the
+    // two sources is one word and produces no visible symptom either way.
+    const yml = readFileSync(path.join(actionsDir, 'pr-review', 'action.yml'), 'utf8');
+    expect(yml).toMatch(/git -C "\$WORK_DIR" show "\$\{BASE_SHA\}:\$\{CICD_CONFIG_FILE\}"/);
+    expect(yml).not.toMatch(/config="\$\{WORK_DIR\}\/\$\{CICD_CONFIG_FILE\}"/);
+  });
+
+  it('pr-review parses config.env rather than sourcing it', () => {
+    const yml = readFileSync(path.join(actionsDir, 'pr-review', 'action.yml'), 'utf8');
+    expect(yml).toContain('engine/load-cicd-config.sh');
+    // `source`/`.` on a file from a consumer repo is arbitrary execution inside
+    // the reviewer, with GH_TOKEN and the OpenRouter key in scope.
+    expect(yml).not.toMatch(/^\s*(source|\.)\s+.*CICD_CONFIG_FILE/m);
+  });
+
+  it('no action input that config.env is meant to supply carries a non-empty default', () => {
+    // The loader's precedence rule is "a name already set in the environment was
+    // passed explicitly by the caller, so it wins". An input with a default is
+    // ALWAYS set — so a non-empty default silently makes the corresponding
+    // config.env key dead. strict-skipped shipped exactly that way.
+    const yml = readFileSync(path.join(actionsDir, 'pr-review', 'action.yml'), 'utf8');
+    const configurable = ['strict-skipped'];
+    for (const input of configurable) {
+      const block = yml.slice(yml.indexOf(`  ${input}:`));
+      const def = block.match(/default:\s*(.*)/)?.[1]?.trim();
+      expect(def, `inputs.${input} default`).toMatch(/^(''|"")$/);
+    }
+  });
+
   it('ci-gate refuses an empty required-jobs list', () => {
     // A gate that passes unconditionally is worse than no gate: it looks like
     // protection. Pinned here as well as in ci-gate.test.mjs because the action
