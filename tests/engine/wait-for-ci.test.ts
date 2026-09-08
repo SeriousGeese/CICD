@@ -124,7 +124,7 @@ type Result = {
 // which is ~0.5s per poll on a Windows runner. The default 5s test timeout is
 // not enough for a case that polls to POLL_TIMEOUT, and it fails as an
 // unattributed STACK_TRACE_ERROR rather than as anything you could diagnose.
-describe.skip("wait_for_ci return-code contract", { timeout: 60_000 }, () => {
+describe("wait_for_ci return-code contract", { timeout: 60_000 }, () => {
   let dir: string;
   let stateDir: string;
   let harness: string;
@@ -469,7 +469,7 @@ echo "---END---"
  * precise verdict into "polling timed out", which is how the §2 short-circuit
  * and the §7 poll drifted apart in the first place.
  */
-describe.skip("wait_for_ci call sites", () => {
+describe("wait_for_ci call sites", () => {
   const lines = script.split("\n");
   const callIndexes = lines
     .map((l, i) => (/^\s*wait_for_ci "/.test(l) ? i : -1))
