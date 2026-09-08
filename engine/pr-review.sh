@@ -1758,9 +1758,15 @@ CICD_FEATURE_DEPENDABOT_SKIP="$(cicd_flag CICD_FEATURE_DEPENDABOT_SKIP false)"
 if [ -n "${CICD_REQUIRED_CHECKS_FALLBACK:-}" ]; then
   REQUIRED_CHECKS_FALLBACK="$CICD_REQUIRED_CHECKS_FALLBACK"
   export REQUIRED_CHECKS_FALLBACK
-elif [ -z "${REQUIRED_CHECKS_FALLBACK:-}" ]; then
-  annotate warning "CICD_REQUIRED_CHECKS_FALLBACK is not set in .cicd/config.env, so the required-check fallback stays 'gate'. If this repo has no job named 'gate', every review will block on a context that can never register. Set it to this repo's required check name(s)."
 fi
+
+# Whether to warn about an unconfigured fallback. The WARNING is emitted from
+# main(), not from here: annotate() writes a workflow command to STDOUT, and a
+# top-level write corrupts the stdout of every function a library-mode caller
+# invokes — it turned the JSON that check_ci_status returns into unparseable
+# output and broke 13 equivalence cases before this was moved.
+CICD_FALLBACK_UNSET=false
+[ -z "${REQUIRED_CHECKS_FALLBACK:-}" ] && CICD_FALLBACK_UNSET=true
 
 CICD_DRY_RUN="${CICD_DRY_RUN:-false}"
 case "$CICD_DRY_RUN" in 1|true|TRUE|yes) CICD_DRY_RUN=true ;; *) CICD_DRY_RUN=false ;; esac
@@ -2631,6 +2637,10 @@ main() {
   local qg_last="none"
   local qg_failure_context=""
   local automerge_eligible=false
+
+  if [ "$CICD_FALLBACK_UNSET" = "true" ]; then
+    annotate warning "CICD_REQUIRED_CHECKS_FALLBACK is not set in .cicd/config.env, so the required-check fallback stays 'gate'. required_contexts() FAILS OPEN to it, so in a repo with no job named 'gate' every review blocks on a context that can never register. Set it to this repo's required check name(s)."
+  fi
 
   # Dependabot short-circuit (from promptci-cloud). Placed before the
   # default-branch priming below so a skipped PR costs zero API calls.
