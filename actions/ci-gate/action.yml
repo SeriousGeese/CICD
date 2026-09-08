@@ -1,0 +1,34 @@
+name: 'Aggregate CI gate'
+description: >-
+  Fails unless every named job is present in `needs` AND concluded `success`.
+  Intended to be the single required status check on a protected branch.
+inputs:
+  needs:
+    description: >-
+      `${{ toJSON(needs) }}` from the gate job. Must be passed explicitly —
+      an action cannot read its caller's needs context.
+    required: true
+  required-jobs:
+    description: >-
+      Comma-separated job ids that must have succeeded. An empty value is
+      REJECTED rather than treated as "nothing required", because a gate that
+      passes unconditionally is worse than no gate: it looks like protection.
+    required: true
+runs:
+  using: composite
+  steps:
+    # Why a script rather than a plain `needs:` list — GitHub's semantics are the
+    # opposite of a gate in both directions, and both are silent:
+    #   * a SKIPPED dependency does not fail the dependent job, and a required
+    #     check reporting `skipped` counts as PASSING;
+    #   * a required check that never REPORTS blocks the merge forever, because
+    #     GitHub does not synthesise a pass for a path-filtered workflow.
+    # So anything not literally `success` fails, and a required job missing from
+    # `needs` entirely — renamed, deleted, dropped from the list — fails too.
+    # "I could not see it" is never "it passed".
+    - shell: bash
+      env:
+        GATE_NEEDS: ${{ inputs.needs }}
+        GATE_REQUIRED_JOBS: ${{ inputs.required-jobs }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: node "${ACTION_PATH}/../../engine/ci-gate.mjs"
