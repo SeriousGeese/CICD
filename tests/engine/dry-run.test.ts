@@ -169,6 +169,48 @@ echo "HOLD_LABEL=$HOLD_LABEL"`,
     expect(out).toContain('mergeStateStatus=BLOCKED');
   });
 
+  it('dispatches NO workflow — the shadow must not cause runs', () => {
+    // A shadow that dispatches CI is CAUSING a run, which is the one thing
+    // "advisory only, decides nothing" promises it does not do. On a repo with a
+    // sharded Playwright matrix the e2e one is ~20 hosted minutes per PR that
+    // nobody asked for.
+    //
+    // Two of these four are unreachable today — merge_pr returns 1 in dry-run, so
+    // the post-merge block never runs — and they are guarded anyway, because
+    // "unreachable" is a CONSEQUENCE, not a guarantee. The comment-path bug was
+    // exactly this shape: a step nothing could reach, until a step above it
+    // failed and it was reached after all.
+    const out = callInDryRun(
+      `${NO_HOLDS}
+CICD_FEATURE_E2E_GATE=true
+CICD_FEATURE_STAGE_DEPLOY=true
+CICD_FEATURE_BEADS=true
+dispatch_ci || true
+dispatch_e2e_gate || true
+dispatch_stage_deploy || true
+dispatch_close_beads || true`,
+      'true',
+    );
+    // Asserted on the ENGINE's own success lines, not on the gh stub's marker:
+    // each dispatch captures the stub's stdout into a variable, so the marker
+    // never reaches the log either way and a check for it would pass vacuously.
+    expect(out).not.toMatch(/Dispatched CI on/);
+    expect(out).not.toMatch(/Dispatched (e2e|the stage deploy|close-beads)/i);
+    // And each says what it would have done, so the divergence is explained in
+    // the log rather than looking like the dispatch silently doing nothing.
+    for (const what of ['ci.yml', 'e2e.yml', 'deploy-stage.yml', 'close-beads.yml']) {
+      expect(out, `no DRY RUN line for ${what}`).toContain(what);
+    }
+  });
+
+  it('DOES dispatch when dry-run is off', () => {
+    // The other direction, so the guard cannot be satisfied by a dispatch that
+    // stopped working for an unrelated reason.
+    const out = callInDryRun(`${NO_HOLDS}\ndispatch_ci || true`, 'false');
+    expect(out).toMatch(/Dispatched CI on/);
+    expect(out).not.toMatch(/DRY RUN: would dispatch/);
+  });
+
   it('accepts the usual truthy spellings and defaults to OFF', () => {
     // A config file written by hand will say `1` or `yes` sooner or later, and a
     // silently-ignored dry-run flag is the worst possible way to find that out.
