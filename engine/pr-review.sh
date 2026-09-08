@@ -542,6 +542,14 @@ would_orphan_children() {
 # anyway, because a redundant rebuild is cheap while a missed deploy leaves stage silently
 # stale (DnD-himhn).
 dispatch_stage_deploy() {
+  # Shadow mode dispatches nothing. Unreachable today — merge_pr returns 1 in dry-run, so the post-merge block
+  # never runs — but that is a CONSEQUENCE, not a guarantee. The comment-path bug
+  # was exactly this shape: a step that could not be reached, until a step above
+  # it failed and it was.
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    log "  DRY RUN: would dispatch deploy-stage.yml on main; not dispatching."
+    return 0
+  fi
   # the consumer has no deploy-stage workflow
   [ "$CICD_FEATURE_STAGE_DEPLOY" = "true" ] || { return 0; }
   local dispatch_out
@@ -565,6 +573,15 @@ dispatch_stage_deploy() {
 # wait_for_ci() fails closed when the dispatched checks never appear, so a
 # failed dispatch here blocks the merge rather than letting it through.
 dispatch_ci() {
+  # Shadow mode dispatches nothing. A shadow that dispatches CI is CAUSING a run, which is the one thing
+  # "advisory only" promises it does not do. The consequence is honest and is
+  # logged: without the dispatch a zero-check SHA fails closed after the grace,
+  # where the real reviewer would have healed it — an EXPECTED divergence, not a
+  # finding about the PR.
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    log "  DRY RUN: would dispatch ci.yml on the PR head; not dispatching."
+    return 0
+  fi
   local dispatch_out
   if dispatch_out="$($GH_CLI workflow run ci.yml --repo "$REPO" --ref "$PR_HEAD_REF" 2>&1)"; then
     log "  Dispatched CI on ${PR_HEAD_REF} (bot pushes don't fire pull_request triggers)"
@@ -620,6 +637,13 @@ dispatch_ci() {
 # this fires. Nothing in the shim reads the PR's code: only main's e2e.yml paths-ignore
 # and the PR's file list, both of which are what branch protection actually cares about.
 dispatch_e2e_gate() {
+  # Shadow mode dispatches nothing. Same rule as dispatch_ci, and it costs more here: on a repo with a sharded
+  # Playwright matrix a shadow-triggered e2e run is ~20 hosted minutes of work
+  # nobody asked for, per PR.
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    log "  DRY RUN: would dispatch e2e.yml / e2e-docs-shim.yml; not dispatching."
+    return 0
+  fi
   # the consumer has no e2e workflow to dispatch
   [ "$CICD_FEATURE_E2E_GATE" = "true" ] || { return 0; }
   local dispatch_out
@@ -884,6 +908,13 @@ resolve_live_tip() {
 # Bead auto-close (DnD-91ye4): bot merges never fire pull_request:closed, so
 # dispatch the close-beads workflow explicitly, same pattern as the deploy.
 dispatch_close_beads() {
+  # Shadow mode dispatches nothing. Unreachable today for the same reason as dispatch_stage_deploy, and guarded
+  # for the same reason: a shadow must not be able to close another repo's issue
+  # tracker if the path above it ever changes.
+  if [ "$CICD_DRY_RUN" = "true" ]; then
+    log "  DRY RUN: would dispatch close-beads.yml; not dispatching."
+    return 0
+  fi
   # the consumer does not use the beads tracker
   [ "$CICD_FEATURE_BEADS" = "true" ] || { return 0; }
   if $GH_CLI workflow run close-beads.yml --repo "$REPO" --ref main -f pr_number="$PR_NUMBER" 2>&1; then
