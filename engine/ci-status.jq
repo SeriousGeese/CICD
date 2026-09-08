@@ -80,7 +80,24 @@
 
 # The bot must never wait on itself. Matches how pr-review.sh has always
 # excluded its own check run, by name prefix.
-| map(select(.name | startswith("🤖 Auto-Review") | not))
+#
+# $reviewer_prefix rather than a literal, because this is not free-form naming:
+# a reviewer job named OUTSIDE the prefix is invisible as a reviewer and
+# therefore counts as CI, so the reviewer waits for its own queued check run.
+# That deadlock was observed for real while running a second reviewer alongside
+# the first in shadow mode — its queued check read to the incumbent as an
+# in-progress CI check while it sat queued behind the incumbent on the same
+# single runner, and only ONE of the two directions hangs, which is what makes
+# it easy to miss.
+#
+# REQUIRED, with no in-program default: the two-slash alternative operator is
+# banned in this file (jq 1.7.1 rejects it as an object-construction value, and
+# the ban is asserted on the source text), and a jq program cannot otherwise
+# default an unbound $var — an unbound one is a COMPILE error, so every caller
+# must bind it. ci-lib.sh defaults it to the literal every consumer already
+# uses, which is where a default belongs anyway: in the one place that knows
+# what the fleet is called.
+| map(select(.name | startswith($reviewer_prefix) | not))
 
 | map(select(
     . as $c

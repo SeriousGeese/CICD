@@ -66,7 +66,9 @@ const posix = (p) => p.split(path.sep).join('/');
 function jqOutputShape() {
   const out = spawnSync(
     'jq',
-    ['-s', '--argjson', 'superseded', '[]', '--argjson', 'required', '[]', '--argjson', 'strict_skipped', 'false', '-f', path.join(scriptsDir, 'ci-status.jq')],
+    // reviewer_prefix has no in-program default (`//` is banned in that file and
+    // an unbound $var is a jq compile error), so every direct caller binds it.
+    ['-s', '--argjson', 'superseded', '[]', '--argjson', 'required', '[]', '--argjson', 'strict_skipped', 'false', '--arg', 'reviewer_prefix', '🤖 Auto-Review', '-f', path.join(scriptsDir, 'ci-status.jq')],
     {
       input: JSON.stringify({
         total_count: 1,

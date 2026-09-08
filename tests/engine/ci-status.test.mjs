@@ -17,7 +17,7 @@ const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 const jqProgram = path.join(scriptsDir, 'ci-status.jq');
 
 /** Invoke the real jq with a stream of page objects, as --paginate emits them. */
-function ciStatus(pages, { superseded = [], required = [] } = {}) {
+function ciStatus(pages, { superseded = [], required = [], reviewerPrefix = '🤖 Auto-Review' } = {}) {
   const input = pages.map((page) => JSON.stringify(page)).join('\n');
   const out = execFileSync(
     'jq',
@@ -29,6 +29,9 @@ function ciStatus(pages, { superseded = [], required = [] } = {}) {
       '--argjson',
       'required',
       JSON.stringify(required), '--argjson', 'strict_skipped', 'false',
+      // Bound on every call because the program has no default for it: `//` is
+      // banned here, and an unbound $var is a jq COMPILE error, not a null.
+      '--arg', 'reviewer_prefix', reviewerPrefix,
       '-f',
       jqProgram,
     ],
@@ -99,6 +102,27 @@ describe('scripts/ci-status.jq', () => {
     // 8 raw runs minus the self-review minus the two superseded auto-merge
     // generations: e2e, auto-merge, Generated types, ci, audit.
     expect(status.total).toBe(5);
+  });
+
+  it('takes the reviewer prefix from the caller, so a second reviewer can be excluded too', () => {
+    // Not cosmetic. A reviewer job named outside the prefix is invisible AS a
+    // reviewer and therefore counts as CI, so the reviewer waits for its own
+    // queued check run. Observed while running a shadow reviewer alongside the
+    // incumbent on a single runner: the shadow's QUEUED check read to the
+    // incumbent as an in-progress CI check, while the shadow sat queued behind
+    // the incumbent. Only the incumbent hangs, which is what makes it easy to
+    // miss on a read.
+    const pages = [
+      page([
+        run({ name: 'ci', conclusion: 'success' }),
+        run({ name: 'Bot Review #42', status: 'queued', conclusion: null }),
+      ]),
+    ];
+    // Under the default prefix the second reviewer is ordinary CI, and CI is
+    // therefore NOT complete.
+    expect(ciStatus(pages).all_success).toBe(false);
+    // Told what its reviewers are called, the reduction is green.
+    expect(ciStatus(pages, { reviewerPrefix: 'Bot Review' }).all_success).toBe(true);
   });
 
   it('excludes the bot own check run by name prefix', () => {
