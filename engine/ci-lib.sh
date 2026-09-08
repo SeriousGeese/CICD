@@ -125,6 +125,7 @@ ci_status_json() {
     --argjson superseded "$superseded" \
     --argjson required "$required" \
     --argjson strict_skipped "$strict_skipped" \
+    --arg reviewer_prefix "${REVIEWER_CHECK_PREFIX:-🤖 Auto-Review}" \
     -f "$CI_STATUS_JQ" 2>&1)" || jq_rc=$?
   if [ "$jq_rc" -ne 0 ] || [ -z "$parsed" ]; then
     log "  check-runs jq parse FAILED (exit=${jq_rc}): $(printf '%s' "$parsed" | head -c 200)"
