@@ -745,56 +745,13 @@ approve_held_runs() {
   [ "$count" -gt 0 ]
 }
 
-# Does this PR touch any path ci.yml would actually build or test? (DnD-7k9o0)
-#
-# ci.yml's push/pull_request triggers carry paths-ignore: **.md, docs/**,
-# content/** — GitHub skips CI iff EVERY changed file matches one of those
-# globs. So the PR is "CI-relevant" exactly when at least one changed file falls
-# OUTSIDE them. This is the missing half of wait_for_ci's docs-only shortcut:
-# "zero check runs" is only safe to read as "no CI applies" when this returns
-# "false". For a CI-relevant PR, zero checks means "CI has not registered yet"
-# (a second commit pushed as the review starts, or a run cancelled by ci.yml's
-# cancel-in-progress concurrency) — NEVER "docs-only". Reading it as docs-only
-# is how PR #1566 merged over a red shard-2 guardrail on 2026-07-20.
-#
-# Prints "true" (CI applies — never take the docs-only path) or "false"
-# (docs/content-only — the docs-only grace is legal). Fails SAFE to "true" when
-# the changed-file list cannot be read: an unverifiable PR must not get the
-# docs-only pass. Keep the case globs in sync with ci.yml's paths-ignore.
-pr_touches_ci_paths() {
-  local files api_exit=0
-  files="$($GH_CLI pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' 2>&1)" || api_exit=$?
-  if [ "$api_exit" -ne 0 ]; then
-    log "  could not read PR changed files (exit=${api_exit}) — assuming CI applies (fail safe): $(printf '%s' "$files" | head -c 200)"
-    echo "true"; return
-  fi
-  # An empty list is not a real PR state; treat it as CI-relevant rather than
-  # waving the change through as docs-only.
-  if [ -z "$files" ]; then
-    log "  PR reports zero changed files — assuming CI applies (fail safe)"
-    echo "true"; return
-  fi
-  local f
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    case "$f" in
-      # Mirrors ci.yml's paths-ignore EXACTLY (pinned by prReviewCiGate.test.ts).
-      # *.md and docs/* were removed from both in DnD-9zzso: markdown now runs CI,
-      # because the tests that validate markdown live in the Jest suite.
-      content/*) ;;  # content/**
-      .beads/*)  ;;  # .beads/**
-      *) echo "true"; return ;;  # a file ci.yml builds/tests → CI applies
-    esac
-  done <<< "$files"
-  echo "false"
-}
 
 # Does this PR touch any path the E2E suite is meant to protect? (DnD-yepkx)
 #
-# Sibling of pr_touches_ci_paths, and it needs
-# its own arms because e2e.yml's push paths-ignore is a THIRD list: **.md,
-# docs/**, content/**, .beads/** — CI's list plus .beads/**, and unlike the
-# deploy it does ignore content/** (no Playwright spec reads the compendium).
+# Needs its own arms because e2e.yml's push paths-ignore is its own list:
+# **.md, docs/**, content/**, .beads/** — and unlike the deploy it does ignore
+# content/** (no Playwright spec reads the compendium). (There was once a
+# pr_touches_ci_paths beside this; it went with the docs-only grace.)
 # Keep these globs in sync with e2e.yml's paths-ignore.
 #
 # dispatch_e2e_gate() needs this gate because workflow_dispatch runs IGNORE
@@ -834,7 +791,7 @@ pr_touches_e2e_paths() {
 }
 
 # Does this PR touch any path a stage deploy would actually ship? (sibling of
-# pr_touches_ci_paths / pr_touches_e2e_paths, consumed by dispatch_stage_deploy)
+# pr_touches_e2e_paths, consumed by dispatch_stage_deploy)
 #
 # deploy-stage.yml's push trigger carries paths-ignore: **.md, docs/**,
 # .beads/** so a human-pushed docs-only merge never rebuilds and restarts
@@ -2836,9 +2793,6 @@ main() {
   # wait_for_ci decision. When "true", the docs-only zero-checks shortcut is
   # forbidden: a code PR whose head SHA has no checks yet is CI-pending, never
   # docs-only, and must not be merged over absent/red CI (DnD-7k9o0).
-  local ci_relevant
-  ci_relevant="$(pr_touches_ci_paths)"
-  log "PR CI-relevance (touches non-docs paths ci.yml builds/tests): ${ci_relevant}"
 
   # ── 2. Bot-commit short-circuit ────────────────────────────────────────
   # If the latest PR commit is our own fix/sync push, don't re-review — just
