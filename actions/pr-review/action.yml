@@ -39,9 +39,12 @@ inputs:
       Set true for a repo WITHOUT an aggregate `gate` job. The precise rule
       depends on required_contexts(), which FAILS OPEN — so with a wrong or empty
       required set every skipped check reads as a pass and the merge gate quietly
-      stops gating.
+      stops gating. DEFAULTS TO EMPTY, not 'false': the config loader treats a
+      set name as "the caller passed it explicitly, so it wins", and a non-empty
+      default would make CICD_STRICT_SKIPPED in .cicd/config.env permanently
+      dead. The engine supplies the real default.
     required: false
-    default: 'false'
+    default: ''
   dry-run:
     description: >-
       Review and comment, but never push a fix or merge. Use for shadow-mode
@@ -94,26 +97,45 @@ runs:
       run: |
         set -euo pipefail
 
-        # Per-repo config, from the PR head. Only CICD_* names are honoured, and
-        # they are read as data rather than sourced as shell: this file arrives
-        # from the PR under review, so `source`ing it would hand a PR author
-        # arbitrary code execution inside the reviewer.
-        config="${WORK_DIR}/${CICD_CONFIG_FILE}"
-        if [ -f "$config" ]; then
-          echo "Loading ${CICD_CONFIG_FILE}"
-          while IFS='=' read -r key value; do
-            case "$key" in
-              CICD_*)
-                value="${value%\"}"; value="${value#\"}"
-                # An input passed explicitly wins over the file, so a shadow run
-                # can force dry-run regardless of what the branch says.
-                if [ -z "${!key:-}" ]; then
-                  printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
-                  export "$key=$value"
-                fi
-                ;;
-            esac
-          done < <(grep -E '^\s*CICD_[A-Z_]+=' "$config" | sed 's/^[[:space:]]*//; s/[[:space:]]*#.*$//')
+        # Per-repo config. Read from the BASE commit, NOT the PR head.
+        #
+        # `.cicd/quality-gates.sh` is deliberately taken from the head — it is
+        # product code, and a PR that changes how the project builds must be
+        # reviewable as part of that PR. This file is the opposite case: it names
+        # the required checks and the feature flags, i.e. it configures the gate
+        # that decides whether this very PR merges. Reading it from the head
+        # would let a PR author weaken their own merge gate — set
+        # CICD_REQUIRED_CHECKS_FALLBACK to a context that does not exist and
+        # required_contexts() FAILS OPEN, after which every skipped check counts
+        # as a pass.
+        #
+        # Consequence, and it is the correct one: the PR that first ADDS
+        # .cicd/config.env runs under defaults, and the file takes effect once
+        # merged. That is how every other trusted-ref input here already behaves.
+        config=""
+        if [ -n "${BASE_SHA:-}" ]; then
+          if ! git -C "$WORK_DIR" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git -C "$WORK_DIR" fetch --depth=1 origin "$BASE_SHA" >/dev/null 2>&1 || true
+          fi
+          if git -C "$WORK_DIR" cat-file -e "${BASE_SHA}:${CICD_CONFIG_FILE}" 2>/dev/null; then
+            config="$(git -C "$WORK_DIR" show "${BASE_SHA}:${CICD_CONFIG_FILE}")"
+            echo "Loading ${CICD_CONFIG_FILE} from base ${BASE_SHA}"
+          fi
+        fi
+
+        if [ -n "$config" ]; then
+          # Parsed as data, never sourced: `source` on a file from another repo
+          # is arbitrary execution inside the reviewer. See engine/load-cicd-config.sh
+          # for what the parser accepts and why it is a tested file rather than
+          # an inline pipeline.
+          while IFS= read -r assignment; do
+            [ -n "$assignment" ] || continue
+            printf '%s\n' "$assignment" >> "$GITHUB_ENV"
+            export "${assignment?}"
+            echo "  ${assignment%%=*}"
+          done < <(printf '%s\n' "$config" | bash "${ACTION_PATH}/../../engine/load-cicd-config.sh" -)
+        else
+          echo "No ${CICD_CONFIG_FILE} at the base commit — using engine defaults."
         fi
 
         # The engine's own review-prompt.md stays per-repo — it is product
