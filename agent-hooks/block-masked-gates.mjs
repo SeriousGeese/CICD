@@ -270,8 +270,14 @@ export function stripLeadingWrappers(stage) {
 
 /** True when this pipeline stage, once its wrappers are stripped, IS a gate invocation. */
 export function isGateStage(stage) {
-  return GATE_AT_START.test(stripLeadingWrappers(stage));
+  const command = stripLeadingWrappers(stage);
+  // A help lookup (`bd dolt push --help | head`, `dotnet test -h | grep filter`) prints usage and
+  // exits without running anything, so there is no verdict for the pipe to mask.
+  if (HELP_FLAG.test(command)) return false;
+  return GATE_AT_START.test(command);
 }
+
+const HELP_FLAG = /(?:^|\s)(?:--help|-h|-\?|\/\?)(?=\s|$)/;
 
 /**
  * The original, pre-stage-start behaviour: gate token ANYWHERE, filter pipe anywhere in

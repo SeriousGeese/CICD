@@ -79,6 +79,24 @@ test("Unity and .NET commands that are not test or compile gates stay allowed", 
   }
 });
 
+test("a help lookup on a gate command is not a gate", () => {
+  for (const c of [
+    "bd dolt push --help | head",
+    "bd dolt pull -h | grep remote",
+    "dotnet test --help | grep filter",
+    "npx vitest --help | head -40",
+    "unity command run_tests --help | tail",
+    "rtk npm test -- --help | head",
+  ]) {
+    assert.equal(isMaskedGate(c), false, c);
+  }
+  assert.equal(isMaskedGatePowerShell("dotnet build -? | Select-String verbosity"), false);
+  // ...but a flag that merely CONTAINS "help" is still a real run, and so is a later gate.
+  for (const c of ["npm test -- --helpers-dir x | tail", "jest --testNamePattern help | tail", "bd dolt push --help; bd dolt push | tail -1"]) {
+    assert.equal(isMaskedGate(c), true, c);
+  }
+});
+
 test("blocks the canonical masked gates", () => {
   const bad = [
     "npm test | tail -8",
