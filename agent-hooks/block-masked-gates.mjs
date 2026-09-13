@@ -72,10 +72,27 @@ const NODE_FLAGS = String.raw`(?:--[\w-]+(?:=\S+)?\s+)*`;
 const NODE_MODULES_PATH = String.raw`\S*node_modules[\\/]`;
 const NODE_ENTRY_RUNNERS = String.raw`(?:\.bin[\\/](?:(?:jest|vitest|tsc|eslint)(?![-\w])|playwright\s+test|next\s+build)|(?:jest|vitest|eslint|typescript)[\\/]\S*|@playwright[\\/]test[\\/]\S*\s+test|next[\\/]\S*\s+build)`;
 const NODE_ENTRY = String.raw`node\s+${NODE_FLAGS}${NODE_MODULES_PATH}${NODE_ENTRY_RUNNERS}`;
+
+// Unity and .NET gates. A Unity project's agents run tests and compiles through three shapes,
+// and without them this guard guards nothing there:
+//   - the unity CLI's command channel: `unity command run_tests --mode editor`,
+//     `unity command recompile` (the compile gate);
+//   - the Editor in batch mode: `Unity.exe -batchmode -projectPath . -runTests …`. The executable
+//     path is usually quoted (it lives under Program Files), and quoted text is blanked before
+//     matching, so the stage can reach here as bare flags — hence the second, flag-led form. It
+//     still requires `-runTests`, so `-batchmode -buildTarget …` builds are not matched;
+//   - `dotnet test` / `dotnet build` against the generated solution.
+// Flags may carry a value (`--format json`), and the command name may itself be a flag's value
+// (`--query run_tests`), so a value is anything that is neither a flag nor a gate command.
+const UNITY_CLI = String.raw`unity\s+command\s+(?:--[\w-]+(?:=\S+|\s+(?!run_tests\b|recompile\b)[^-\s]\S*)?\s+)*(?:run_tests|recompile)`;
+// An unquoted `/c/Program\ Files/...` path reaches here split at the escaped space, so leading
+// path FRAGMENTS (tokens with a slash) may precede the executable.
+const UNITY_BATCH = String.raw`(?:(?:\S*[\\/]\S*\s+)*(?:\S*[\\/])?Unity(?:\.exe)?\s+|-(?:batchmode|projectPath|nographics|quit)\b\s+)(?:\S+\s+)*?-runTests`;
+const DOTNET = String.raw`dotnet\s+(?:test|build)`;
 export const GATE = new RegExp(
   String.raw`\b(?:npm\s+(?:run\s+)?(?:test|lint|build|type-?check)|npx\s+${DIRECT_RUNNERS}|yarn\s+(?:test|lint|build|type-?check)|pnpm\s+` +
     PNPM_SELECTORS +
-    String.raw`(?:(?:run\s+)?(?:test|lint|build|type-?check)|(?:exec\s+|dlx\s+)?${DIRECT_RUNNERS})|pnpx\s+${DIRECT_RUNNERS}|${NODE_ENTRY}|(?:jest|vitest|eslint)(?![-\w])|tsc\s+--noEmit|next\s+build|bd\s+dolt\s+(?:push|pull)|(?:node\s+)?\S*bd-dolt-sync\.mjs\s+(?:push|pull))\b`,
+    String.raw`(?:(?:run\s+)?(?:test|lint|build|type-?check)|(?:exec\s+|dlx\s+)?${DIRECT_RUNNERS})|pnpx\s+${DIRECT_RUNNERS}|${NODE_ENTRY}|${UNITY_CLI}|${UNITY_BATCH}|${DOTNET}|(?:jest|vitest|eslint)(?![-\w])|tsc\s+--noEmit|next\s+build|bd\s+dolt\s+(?:push|pull)|(?:node\s+)?\S*bd-dolt-sync\.mjs\s+(?:push|pull))\b`,
 );
 export const MASK = /\|\s*(?:tail|head|grep|rg|wc)\b/;
 

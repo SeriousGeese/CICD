@@ -10,7 +10,7 @@ all of them.
 |---|---|
 | `block-bash-double-backslash.mjs` | A Bash command containing `\\`, which the Bash tool's handoff collapses to `\` before bash runs it, so the command silently runs as a different string. |
 | `block-pr-body-heredoc.mjs` | A heredoc feeding `gh pr create`/`gh pr edit`, and any command over ~4 KB carrying a heredoc: large heredocs die intermittently in that handoff. |
-| `block-masked-gates.mjs` | A test/lint/build/type-check command piped into `tail`/`head`/`grep`/`Select-Object`/…, which reports the filter's exit code instead of the gate's. |
+| `block-masked-gates.mjs` | A test/lint/build/type-check command piped into `tail`/`head`/`grep`/`Select-Object`/…, which reports the filter's exit code instead of the gate's. Covers npm/pnpm/yarn scripts, jest/vitest/tsc/eslint/playwright, the Unity CLI (`unity command run_tests`/`recompile`), Unity batch mode (`-runTests`) and `dotnet test`/`build`. |
 
 `refusal-notice.mjs` and `shell-path-lib.mjs` are shared helpers. Repository-specific
 guards (claims, worktrees, issue tracker) stay in their own repositories and may import
