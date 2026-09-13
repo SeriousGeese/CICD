@@ -11,6 +11,7 @@ all of them.
 | `block-bash-double-backslash.mjs` | A Bash command containing `\\`, which the Bash tool's handoff collapses to `\` before bash runs it, so the command silently runs as a different string. |
 | `block-pr-body-heredoc.mjs` | A heredoc feeding `gh pr create`/`gh pr edit`, and any command over ~4 KB carrying a heredoc: large heredocs die intermittently in that handoff. |
 | `block-masked-gates.mjs` | A test/lint/build/type-check command piped into `tail`/`head`/`grep`/`Select-Object`/…, which reports the filter's exit code instead of the gate's. Covers npm/pnpm/yarn scripts, jest/vitest/tsc/eslint/playwright, the Unity CLI (`unity command run_tests`/`recompile`), Unity batch mode (`-runTests`) and `dotnet test`/`build`. |
+| `block-prose-backtick-substitution.mjs` | An unescaped backtick in a `bd` or `gh` argument — prose, not shell — where bash reads it as command substitution and silently replaces the backticked word with a command's output (or nothing). Single quotes, `\`` and `--body-file` pass; `$(…)` is untouched. |
 
 `refusal-notice.mjs` and `shell-path-lib.mjs` are shared helpers. Repository-specific
 guards (claims, worktrees, issue tracker) stay in their own repositories and may import
@@ -47,7 +48,7 @@ Then register the guards in `.claude/settings.json`:
 
 | Matcher | Guards |
 |---|---|
-| `Bash` | `block-bash-double-backslash.mjs`, `block-pr-body-heredoc.mjs` |
+| `Bash` | `block-bash-double-backslash.mjs`, `block-pr-body-heredoc.mjs`, `block-prose-backtick-substitution.mjs` |
 | `Bash\|PowerShell` | `block-masked-gates.mjs` |
 
 and run the node:test suites wherever the consumer runs tests:
