@@ -12,7 +12,8 @@
   "scripts": {
     "test": "vitest run",
     "dev": "vitest",
-    "lint": "eslint tests",
+    "test:agent-hooks": "node --test \"agent-hooks/*.node-test.mjs\"",
+    "lint": "eslint tests agent-hooks",
     "shellcheck": "shellcheck -S warning engine/*.sh"
   },
   "devDependencies": {

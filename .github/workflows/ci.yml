@@ -55,3 +55,8 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      # The vendored Claude Code guards keep node:test suites, not vitest, because they
+      # run in consumer repos that may have no package manager at all (docs/AGENT-HOOKS.md).
+      - name: Agent hook tests
+        run: pnpm test:agent-hooks

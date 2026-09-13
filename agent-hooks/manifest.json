@@ -1,0 +1,17 @@
+{
+  "$comment": "Every file sync.mjs vendors into a consumer's hooks directory. Guards here must be dependency-free: they may import only node: builtins and other files in this list (tests/contract/agent-hooks-dependency-free.test.ts). Consumer-owned files such as <guard>.hint.txt are never listed.",
+  "files": [
+    "block-bash-double-backslash.mjs",
+    "block-bash-double-backslash.node-test.mjs",
+    "block-masked-gates.mjs",
+    "block-masked-gates.node-test.mjs",
+    "block-pr-body-heredoc.mjs",
+    "block-pr-body-heredoc.node-test.mjs",
+    "refusal-notice.mjs",
+    "refusal-notice.node-test.mjs",
+    "shell-path-lib.mjs",
+    "shell-path-lib.node-test.mjs",
+    "sync.mjs",
+    "sync.node-test.mjs"
+  ]
+}
