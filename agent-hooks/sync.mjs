@@ -115,6 +115,23 @@ export function parseShaFile(text) {
   return { ref, envPrefix, files };
 }
 
+/**
+ * The absolute hooks directory, which must sit strictly INSIDE `into`. Sync writes and
+ * deletes there, so `--hooks-dir ../elsewhere` (or an absolute path) is refused rather than
+ * letting a typo rewrite files outside the consumer's tree.
+ * @param {string} into
+ * @param {string} hooksDir
+ */
+export function hooksDest(into, hooksDir) {
+  const root = path.resolve(into);
+  const dest = path.resolve(root, hooksDir);
+  const rel = path.relative(root, dest);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(`--hooks-dir must be a subdirectory of --into (${into}), got: ${hooksDir}`);
+  }
+  return dest;
+}
+
 /** A manifest entry must be a bare filename — never a path that could escape the hooks dir. */
 export function isSafeFileName(name) {
   return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(String(name)) && !String(name).includes('..');
@@ -159,7 +176,7 @@ async function manifestAt(ref, from) {
  * @returns {Promise<string[]>} the files written
  */
 export async function sync(opts) {
-  const dest = path.resolve(opts.into, opts.hooksDir);
+  const dest = hooksDest(opts.into, opts.hooksDir);
   const files = await manifestAt(opts.ref, opts.from);
   const contents = await Promise.all(files.map(async (f) => transform(await readAtRef(opts.ref, f, opts.from), opts.envPrefix)));
 
@@ -180,7 +197,7 @@ export async function sync(opts) {
  * @returns {Promise<string[]>} one line per problem; empty when the vendored copy is exact
  */
 export async function check(opts) {
-  const dest = path.resolve(opts.into, opts.hooksDir);
+  const dest = hooksDest(opts.into, opts.hooksDir);
   const shaPath = path.join(dest, SHA_FILE);
   if (!existsSync(shaPath)) return [`${path.join(opts.hooksDir, SHA_FILE)} is missing — nothing records what was vendored`];
   const rec = parseShaFile(readFileSync(shaPath, 'utf8'));

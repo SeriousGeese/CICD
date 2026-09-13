@@ -5,10 +5,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { NOTHING_RAN_NOTICE, consumerHint } from './refusal-notice.mjs';
 
@@ -64,5 +64,20 @@ for (const guard of Object.keys(TRIGGERS)) {
 
 test('consumerHint is empty for a guard with no hint, and never throws', () => {
   assert.equal(consumerHint(new URL('./no-such-guard.mjs', import.meta.url).href), '');
-  assert.equal(consumerHint('file:///definitely/not/here.mjs'), '');
+  assert.equal(consumerHint(pathToFileURL(path.join(tmpdir(), 'agent-hooks-no-such-dir', 'guard.mjs')).href), '');
+});
+
+test('an unreadable hint is named in the refusal, not silently dropped', () => {
+  // A directory where the hint file should be: readFileSync throws EISDIR on every platform.
+  const dir = scratchCopy('block-masked-gates.mjs');
+  try {
+    mkdirSync(path.join(dir, 'block-masked-gates.hint.txt'));
+    const hint = consumerHint(pathToFileURL(path.join(dir, 'block-masked-gates.mjs')).href);
+    assert.match(hint, /block-masked-gates\.hint\.txt exists but could not be read: E[A-Z]+/);
+    const r = run(dir, 'block-masked-gates.mjs');
+    assert.equal(r.status, 2, 'an unreadable hint must never turn a refusal into an allow');
+    assert.match(r.stderr, /could not be read/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

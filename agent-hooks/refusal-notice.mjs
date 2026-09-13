@@ -22,17 +22,26 @@ export const NOTHING_RAN_NOTICE =
   'executes, so anything chained with the blocked part (&&, ;, |, or a step before it) never ran either.';
 
 /**
- * The consumer's `<guard>.hint.txt` beside the guard file, as ` <text>`, or `''`.
- * Never throws: a missing or unreadable hint must not turn a refusal into a crash.
+ * The consumer's `<guard>.hint.txt` beside the guard file, as ` <text>`, or `''` when there
+ * is none.
+ *
+ * Never throws, deliberately: every guard wraps its work in a fail-OPEN catch, so a throw
+ * from here would turn a refusal into an ALLOWED command. But only a missing file is
+ * silent. Any other failure (permissions, a directory where the file should be) is named in
+ * the refusal, because a hint that exists and cannot be read is a problem someone should see.
  * @param {string} guardUrl the guard's `import.meta.url`
  * @returns {string}
  */
 export function consumerHint(guardUrl) {
+  let hintPath = '';
   try {
-    const hintPath = fileURLToPath(guardUrl).replace(/\.mjs$/, '.hint.txt');
+    hintPath = fileURLToPath(guardUrl).replace(/\.mjs$/, '.hint.txt');
     const text = readFileSync(hintPath, 'utf8').trim();
     return text ? ` ${text}` : '';
-  } catch {
-    return '';
+  } catch (err) {
+    const code = /** @type {{ code?: string }} */ (err)?.code;
+    if (code === 'ENOENT') return '';
+    const name = hintPath ? hintPath.split(/[\\/]/).pop() : 'hint file';
+    return ` [${name} exists but could not be read: ${code ?? String(err)}]`;
   }
 }
