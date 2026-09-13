@@ -7,6 +7,8 @@
     "block-masked-gates.node-test.mjs",
     "block-pr-body-heredoc.mjs",
     "block-pr-body-heredoc.node-test.mjs",
+    "block-prose-backtick-substitution.mjs",
+    "block-prose-backtick-substitution.node-test.mjs",
     "refusal-notice.mjs",
     "refusal-notice.node-test.mjs",
     "shell-path-lib.mjs",
