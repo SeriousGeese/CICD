@@ -29,7 +29,12 @@ const listed = new Set(manifest.files);
 
 function importsOf(source: string): string[] {
   const specs: string[] = [];
-  for (const m of source.matchAll(/^\s*import\s+(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]/gm)) specs.push(m[1]);
+  // The binding list may span lines (`import {\n a,\n} from 'x'`) but never contains a quote:
+  // `[\s\S]*?` here let a side-effect `import 'x';` swallow everything up to a LATER `from`,
+  // so `x` itself was never checked.
+  for (const m of source.matchAll(/^\s*import\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]/gm)) specs.push(m[1]);
+  // Re-exports pull a module in without the word `import`.
+  for (const m of source.matchAll(/^\s*export\s+(?:type\s+)?(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from\s+['"]([^'"]+)['"]/gm)) specs.push(m[1]);
   for (const m of source.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)) specs.push(m[1]);
   for (const m of source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g)) specs.push(m[1]);
   return specs;
@@ -45,6 +50,18 @@ describe('agent-hooks', () => {
     const specs = importsOf(readFileSync(path.join(hooksDir, 'block-masked-gates.mjs'), 'utf8'));
     expect(specs).toContain('node:fs');
     expect(specs).toContain('./refusal-notice.mjs');
+    // Every form a hook could use to reach a module, including the ones without `import`.
+    const forms = [
+      "import a from 'pkg-a';",
+      "import {\n  b,\n  bb,\n} from 'pkg-b';",
+      "import 'pkg-c';",
+      "export * from 'pkg-d';",
+      "export * as e from 'pkg-e';",
+      "export { f, g as h } from 'pkg-f';",
+      "const i = await import('pkg-g');",
+      "const j = require('pkg-h');",
+    ].join('\n');
+    expect(importsOf(forms).sort()).toEqual(['pkg-a', 'pkg-b', 'pkg-c', 'pkg-d', 'pkg-e', 'pkg-f', 'pkg-g', 'pkg-h']);
   });
 
   for (const file of manifest.files.filter((f) => f.endsWith('.mjs'))) {
