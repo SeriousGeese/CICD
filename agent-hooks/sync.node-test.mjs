@@ -16,6 +16,7 @@ import {
   SHA_FILE,
   check,
   formatShaFile,
+  hooksDest,
   isEnvPrefix,
   isPinnedRef,
   isSafeFileName,
@@ -82,6 +83,14 @@ test('pure helpers', () => {
   assert.deepEqual(parseArgs(['--into', '.', '--check']), { into: '.', envPrefix: P, hooksDir: 'scripts/hooks', check: true });
   assert.throws(() => parseArgs(['--into']), /needs a value/);
   assert.throws(() => parseArgs(['--bogus']), /unknown argument/);
+});
+
+test('--hooks-dir must stay inside --into', () => {
+  const into = path.join(tmpdir(), 'consumer');
+  assert.equal(hooksDest(into, 'scripts/hooks'), path.resolve(into, 'scripts/hooks'));
+  for (const bad of ['..', '../elsewhere', 'scripts/../../x', '.', '', path.resolve(tmpdir(), 'abs')]) {
+    assert.throws(() => hooksDest(into, bad), /must be a subdirectory of --into/, JSON.stringify(bad));
+  }
 });
 
 test('transform normalises CRLF and rewrites only the neutral prefix', () => {
