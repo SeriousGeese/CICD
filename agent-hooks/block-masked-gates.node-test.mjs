@@ -34,6 +34,51 @@ function runHook(command, toolName) {
 
 // ── Must BLOCK: real masked gates ───────────────────────────────────────────
 
+// ── Unity and .NET gates ────────────────────────────────────────────────────
+test("blocks Unity CLI, Unity batch-mode and dotnet gates piped into a filter", () => {
+  const bad = [
+    "unity command run_tests --mode editor | tail -20",
+    "unity command run_tests --mode editor --filter SceneBootstrap 2>&1 | grep -i fail",
+    "unity command recompile | head",
+    "unity command --format json run_tests | tail",
+    "unity command --query run_tests | tail",
+    "unity command --format=json recompile | head",
+    "timeout 600 unity command run_tests --mode play | tail -5",
+    "Unity.exe -batchmode -projectPath . -runTests -testPlatform EditMode | tail",
+    "/c/Program\\ Files/Unity/Hub/Editor/6000.6.0f1/Editor/Unity.exe -batchmode -runTests | tail",
+    '"C:/Program Files/Unity/Hub/Editor/6000.6.0f1/Editor/Unity.exe" -batchmode -projectPath . -runTests -testResults r.xml | tail',
+    "dotnet test Tests.csproj | tail -30",
+    "dotnet build Aftermath.slnx 2>&1 | grep -E 'error|warn'",
+  ];
+  for (const c of bad) assert.equal(isMaskedGate(c), true, c);
+  for (const c of [
+    "unity command run_tests --mode editor | Select-Object -Last 20",
+    '& "C:\\Program Files\\Unity\\Hub\\Editor\\6000.6.0f1\\Editor\\Unity.exe" -batchmode -projectPath . -runTests | Select-String Failed',
+    "dotnet build | Measure-Object -Line",
+  ]) {
+    assert.equal(isMaskedGatePowerShell(c), true, c);
+  }
+});
+
+test("Unity and .NET commands that are not test or compile gates stay allowed", () => {
+  for (const c of [
+    "unity command find_gameobjects --name Cop --format json | head",
+    "unity command editor_status | tail -3",
+    "unity status | grep ready",
+    "unity pipeline list | head",
+    "Unity.exe -batchmode -projectPath . -buildTarget Win64 -quit | tail",
+    "dotnet --info | head",
+    "dotnet list package | grep Netcode",
+    "unity command run_tests --mode editor",
+    "set -o pipefail; dotnet test | tail -30",
+    "grep -n runTests Logs/Editor.log | tail",
+    "echo Unity.exe -batchmode -runTests | tail",
+    "cat docs/unity-cli/run_tests.md | head",
+  ]) {
+    assert.equal(isMaskedGate(c), false, c);
+  }
+});
+
 test("blocks the canonical masked gates", () => {
   const bad = [
     "npm test | tail -8",
