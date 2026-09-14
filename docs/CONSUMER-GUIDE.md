@@ -209,3 +209,36 @@ gh pr view <n> --json comments    # the two comments should agree
 If the hook fails on a tree you did not expect to fail, check your install first —
 it only runs `install` when `node_modules` is absent, so a stale local tree gets
 reviewed as-is. That is what the `install` verb is for.
+
+### On a Windows dev box, the gate is `test:win`
+
+`npm test` is **red on Windows and green on CI**, on `main`, before you change
+anything. Four `tests/engine/**` suites assert on Linux-host behaviour — a
+symlink that needs a privilege Windows does not grant by default, a POSIX
+absolute path, and two bash-engine self-checks whose inline `jq`/`gh` stubs
+print differently under MSYS. Nine cases fail for those reasons and nothing else.
+
+That standing red is worse than it sounds: it means a Windows contributor cannot
+tell a regression they caused from the baseline without first running the whole
+suite on `main` and diffing two failure lists by hand.
+
+So run this instead:
+
+```bash
+# on Windows, before you open a PR:
+npm run test:win && npm run lint
+```
+
+`test:win` runs everything `npm test` runs minus those four suites, plus the
+agent-hook `node:test` suites — the 26 files that already pass on Windows. It is
+a **contributor convenience, not the project gate**: CI is Linux and stays on
+`npm test`, which keeps running all 30 files. Nothing is skipped on the host
+that actually votes on a merge.
+
+The excluded list lives in `vitest.win.config.ts` with a host reason beside each
+entry. It may only shrink — when a suite is made host-agnostic, delete its line.
+`tests/contract/windows-gate.test.ts` fails if an entry names a file that no
+longer exists, so the list cannot quietly outlive the problem.
+
+`shellcheck` is not in the Windows gate because it is a separate binary that is
+often absent there; CI runs it on every PR regardless.
