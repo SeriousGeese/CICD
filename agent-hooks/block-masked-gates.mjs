@@ -195,11 +195,63 @@ const FILTER_STAGE = /^\s*(?:tail|head|grep|rg|wc)\b/;
 const TIMEOUT_OPTION =
   /^(?:-[sk]\s+\S+|--signal(?:=|\s+)\S+|--kill-after(?:=|\s+)\S+|--foreground|--preserve-status|-v|--verbose)\s+/;
 
+// ── Consumer capture wrappers (`bash scripts/gate.sh <gate…>`) ───────────────
+//
+// A consuming repo often owns a small script whose whole job is to run the gate
+// it is handed, tee its output to a log and re-emit the gate's own exit code —
+// the sanctioned way to KEEP gate output without a pipe. That script is a
+// wrapper in exactly the sense of `timeout`/`env`/`rtk` above: the gate is still
+// the thing whose exit code a downstream filter would mask. But the stage starts
+// with `bash` (or the script path), which is no runner name, so `GATE_AT_START`
+// never matched and `bash scripts/gate.sh npm test | tail -30` sailed through —
+// the precise shape the guard exists to refuse. Two workers in one consuming
+// repo hit it on the same day, both while correctly following that repo's own
+// documented advice to capture gates with its wrapper.
+//
+// This is matched as a PATTERN, not a path: any `[bash|sh] [<dir>/]gate.sh`, so
+// no consumer's directory layout is baked into the shared source. `gate.sh` is a
+// generic enough name for "re-exec my argument as a gate" to hardcode, and a
+// consumer whose wrapper is spelled differently names it in
+// `AGENT_HOOKS_GATE_WRAPPERS` (comma/space separated BASENAMES) instead of
+// forking this file — `sync.mjs --env-prefix` rewrites the neutral prefix on
+// vendoring, exactly as it does for the escape hatches.
+//
+// NOTE the deliberate asymmetry with `NESTED_SHELL`, which avoids matching
+// `bash scripts/foo.sh` because that runs a FILE whose contents are not in this
+// command string. Here the opposite holds: the gate is an ARGUMENT, right there
+// in the string, and stripping the wrapper hands it to the existing matcher.
+const DEFAULT_GATE_WRAPPERS = ["gate.sh"];
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+let wrapperCache = { key: null, re: null };
+
+/** `^[bash|sh] [<path>/]<wrapper>\s+` for the configured wrapper basenames. */
+function gateWrapperPrefix() {
+  const key = process.env.AGENT_HOOKS_GATE_WRAPPERS ?? "";
+  if (wrapperCache.key === key) return wrapperCache.re;
+  const configured = key
+    .split(/[,\s]+/)
+    .filter(Boolean)
+    // A configured entry is a BASENAME; anything with a separator is a path and
+    // is ignored rather than silently matching nothing.
+    .filter((n) => !/[\\/]/.test(n));
+  const names = configured.length ? configured : DEFAULT_GATE_WRAPPERS;
+  const re = new RegExp(
+    String.raw`^(?:(?:ba|z|da|k)?sh\s+)?(?:\S*[\\/])?(?:${names.map(escapeRe).join("|")})\s+`,
+  );
+  wrapperCache = { key, re };
+  return re;
+}
+
 /**
  * Strip leading command wrappers — VAR=val, `env […]`, `rtk [proxy]`, `sudo`,
- * `nice [-n N]`, `command`, `time`, `nohup`, `exec`, `timeout [opts] N` — off the
- * front of a pipeline stage, in any combination, so `isGateStage` sees the real
- * command word. Token-based rather than one monolithic regex specifically so
+ * `nice [-n N]`, `command`, `time`, `nohup`, `exec`, `timeout [opts] N`, and a
+ * consumer's capture wrapper (`bash scripts/gate.sh …`) — off the front of a
+ * pipeline stage, in any combination, so `isGateStage` sees the real command
+ * word. Token-based rather than one monolithic regex specifically so
  * `timeout`'s value-bearing options and mandatory duration argument are
  * consumed correctly instead of being mistaken for the gate itself.
  */
@@ -227,6 +279,12 @@ export function stripLeadingWrappers(stage) {
       s = s.slice(m[0].length);
       const nm = /^-n\s+\S+\s+/.exec(s);
       if (nm) s = s.slice(nm[0].length);
+      continue;
+    }
+
+    m = gateWrapperPrefix().exec(s);
+    if (m) {
+      s = s.slice(m[0].length);
       continue;
     }
 
@@ -523,7 +581,8 @@ export function isMaskedGatePowerShell(rawCmd) {
 // names it in `block-masked-gates.hint.txt` (see refusal-notice.mjs).
 export const MESSAGE =
   "Blocked: gate command piped into a filter masks its exit code (no pipefail by default) — a failing gate reads as success. " +
-  "This holds even behind a `timeout`/`env`/`nice`/`rtk`/`time` prefix, or any combination of them — the gate is still what the pipe is masking. " +
+  "This holds even behind a `timeout`/`env`/`nice`/`rtk`/`time` prefix, or a capture wrapper that re-runs the gate it is handed " +
+  "(`bash scripts/gate.sh <gate>`), or any combination of them — the gate is still what the pipe is masking. " +
   NOTHING_RAN_NOTICE + " Keep file writes and other side effects in a separate call from gates. " +
   "Run the gate bare and let it stream, or capture the exit explicitly: `<gate> > /dev/null 2>&1; echo EXIT:$?`. " +
   "A trailing `; echo \"X:$?\"` typed straight after the pipeline is NOT that capture — `$?` there is always the last " +

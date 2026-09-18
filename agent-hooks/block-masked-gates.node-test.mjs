@@ -346,6 +346,77 @@ test("isGateStage recognises every timeout/nice shape, and stripLeadingWrappers 
   assert.equal(stripLeadingWrappers("ls node_modules/.bin/jest*"), "ls node_modules/.bin/jest*");
 });
 
+// ── a consumer's capture wrapper defeated the guard entirely ────
+// Reported: `bash scripts/gate.sh npm test | tail -30`. A `gate.sh` wrapper
+// exists precisely so a gate's output can be kept WITH its real exit code, so it
+// is the shape an agent reaches for — and the stage starts with `bash`, which is
+// no runner name, so the underlying `npm test` was never seen. Two workers hit it
+// on the same day, each following their own repo's documented advice.
+
+test("THE BUG: a `bash scripts/gate.sh` capture wrapper no longer defeats the guard", () => {
+  assert.equal(isMaskedGate("bash scripts/gate.sh npm test | tail -5"), true);
+});
+
+test("blocks the capture wrapper in every invocation shape", () => {
+  for (const c of [
+    "bash scripts/gate.sh npm test | tail -5",
+    "scripts/gate.sh npm test | head -20",
+    "./scripts/gate.sh npm run lint | grep error",
+    "sh scripts/gate.sh npx jest | wc -l",
+    "bash gate.sh npm run type-check | tail -3",
+    "bash scripts/gate.sh timeout 900 npm run lint | tail -4",
+    "timeout 900 bash scripts/gate.sh npm test | tail -4",
+    "cd /c/git/example/app && bash scripts/gate.sh npm test 2>&1 | tail -30",
+  ]) {
+    assert.equal(isMaskedGate(c), true, c);
+  }
+});
+
+test("a bare capture-wrapper run with no pipe stays allowed — only the mask is the bug", () => {
+  for (const c of [
+    "bash scripts/gate.sh npm test",
+    "scripts/gate.sh npm run lint",
+    "bash scripts/gate.sh npm test > gate.log 2>&1; echo EXIT:$?",
+  ]) {
+    assert.equal(isMaskedGate(c), false, c);
+  }
+});
+
+test("the pipefail hatch keeps working through the wrapper stripping", () => {
+  assert.equal(isMaskedGate("set -o pipefail; bash scripts/gate.sh npm test | tail -5"), false);
+  assert.equal(isMaskedGate("set -o pipefail; scripts/gate.sh npm run lint | head -20"), false);
+});
+
+test("the wrapper is stripped as a prefix, and non-wrapper `bash`/`gate.sh` text is left alone", () => {
+  assert.equal(stripLeadingWrappers("bash scripts/gate.sh npm test"), "npm test");
+  assert.equal(stripLeadingWrappers("sh ./tools/gate.sh npm run lint"), "npm run lint");
+  assert.equal(stripLeadingWrappers("bash scripts/gate.sh timeout 900 npm test"), "npm test");
+  assert.equal(isGateStage("bash scripts/gate.sh npm test"), true);
+  // Not a wrapper invocation: the script is DATA here, not a command re-running a gate.
+  assert.equal(stripLeadingWrappers("cat scripts/gate.sh"), "cat scripts/gate.sh");
+  assert.equal(isMaskedGate("cat scripts/gate.sh | head -20"), false);
+  assert.equal(isMaskedGate("ls scripts/gate.sh | wc -l"), false);
+  // A wrapper wrapping something that is not a gate is still not a gate.
+  assert.equal(isMaskedGate("bash scripts/gate.sh ls | tail -5"), false);
+});
+
+test("a consumer can name a differently-spelled wrapper without forking the guard", () => {
+  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
+  try {
+    process.env.AGENT_HOOKS_GATE_WRAPPERS = "run-gate.sh, gate.sh";
+    assert.equal(isMaskedGate("bash tools/run-gate.sh npm test | tail -5"), true);
+    assert.equal(isMaskedGate("bash scripts/gate.sh npm test | tail -5"), true);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
+    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
+  }
+});
+
+test("the PowerShell branch sees the wrapper too", () => {
+  assert.equal(isMaskedGatePowerShell("bash scripts/gate.sh npm test | Select-Object -Last 5"), true);
+  assert.equal(isMaskedGatePowerShell("bash scripts/gate.sh npm test"), false);
+});
+
 test("the PowerShell branch has the identical timeout gap, and the fix covers it too", () => {
   assert.equal(isMaskedGatePowerShell("timeout 900 npm test | Select-Object -Last 5"), true);
   assert.equal(isMaskedGatePowerShell("timeout 900 npm run lint | tail -4"), true);
