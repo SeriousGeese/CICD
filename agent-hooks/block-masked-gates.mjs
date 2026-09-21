@@ -246,13 +246,67 @@ function gateWrapperPrefix() {
   return re;
 }
 
+// ── …and the wrapper's OWN options ───────────────────────────────────────────
+//
+// Stripping the wrapper NAME alone is half a fix, and the other half reopened
+// the hole one day later. A capture wrapper takes options of its own before the
+// gate — the consuming repo that reported the original bug documents
+// `gate.sh --name <slug> <gate…>` for naming the log file — so
+// `bash scripts/gate.sh --name probe npm run lint | tail` left `--name probe npm
+// run lint`, whose command word is `--name`. `isGateStage` read that as no gate
+// at all and let the pipe through. The flag is not an exotic spelling either: it
+// is what a fan-out wave reaches for, several gates in one worktree each wanting
+// a readable log, so the guard went quiet for exactly the workflow that needs it
+// most. This is the same shape as `timeout`'s value-bearing options, which have
+// a dedicated token-consuming step directly below for precisely this reason.
+//
+// The arity of a CONSUMER's flag is unknowable from here, so it is not guessed:
+// a flag's value token is consumed only when the remainder after the flag is not
+// already a gate. `--name probe npm test` consumes the pair; a boolean
+// `--quiet npm test` keeps `npm test`. Ties go to the gate — over-consuming
+// would hand back the silent pass this exists to close, while over-blocking is
+// visible, arguable, and has `set -o pipefail;` as its documented hatch.
+const WRAPPER_OPTION = /^--?[A-Za-z][^\s]*(?=\s|$)/;
+const WRAPPER_END_OF_OPTIONS = /^--(?=\s|$)/;
+
+/**
+ * Consume a capture wrapper's own leading options — `--name <slug>`, `-q`,
+ * `--name=<slug>`, and a bare `--` end-of-options marker — from the text
+ * following the wrapper name.
+ */
+function stripWrapperOptions(rest) {
+  let s = rest.trimStart();
+  for (;;) {
+    if (WRAPPER_END_OF_OPTIONS.test(s)) return s.slice(2).trimStart();
+    const om = WRAPPER_OPTION.exec(s);
+    if (!om) return s;
+    const after = s.slice(om[0].length).trimStart();
+    // `--opt=value` carries its value in the one token; a flag standing directly
+    // in front of a gate, or in front of another option, is boolean as far as
+    // anything here can tell.
+    if (
+      om[0].includes("=") ||
+      GATE_AT_START.test(after) ||
+      WRAPPER_OPTION.test(after) ||
+      WRAPPER_END_OF_OPTIONS.test(after)
+    ) {
+      s = after;
+      continue;
+    }
+    const vm = /^\S+/.exec(after);
+    if (!vm) return after;
+    s = after.slice(vm[0].length).trimStart();
+  }
+}
+
 /**
  * Strip leading command wrappers — VAR=val, `env […]`, `rtk [proxy]`, `sudo`,
  * `nice [-n N]`, `command`, `time`, `nohup`, `exec`, `timeout [opts] N`, and a
- * consumer's capture wrapper (`bash scripts/gate.sh …`) — off the front of a
- * pipeline stage, in any combination, so `isGateStage` sees the real command
- * word. Token-based rather than one monolithic regex specifically so
- * `timeout`'s value-bearing options and mandatory duration argument are
+ * consumer's capture wrapper with its own options (`bash scripts/gate.sh
+ * --name probe …`) — off the front of a pipeline stage, in any combination, so
+ * `isGateStage` sees the real command word. Token-based rather than one
+ * monolithic regex specifically so `timeout`'s value-bearing options and
+ * mandatory duration argument — and a capture wrapper's own flags — are
  * consumed correctly instead of being mistaken for the gate itself.
  */
 export function stripLeadingWrappers(stage) {
@@ -284,7 +338,7 @@ export function stripLeadingWrappers(stage) {
 
     m = gateWrapperPrefix().exec(s);
     if (m) {
-      s = s.slice(m[0].length);
+      s = stripWrapperOptions(s.slice(m[0].length));
       continue;
     }
 

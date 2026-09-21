@@ -400,6 +400,62 @@ test("the wrapper is stripped as a prefix, and non-wrapper `bash`/`gate.sh` text
   assert.equal(isMaskedGate("bash scripts/gate.sh ls | tail -5"), false);
 });
 
+// ── …and then the wrapper's OWN option reopened it ─────────────────────────
+// Reported one day after the fix above: `bash scripts/gate.sh --name probe npm
+// run lint | tail -0` sailed through while the same command without `--name`
+// was refused. Stripping the wrapper name left `--name probe npm run lint`,
+// whose command word is `--name`. The flag is the documented way to name a
+// captured run's log file, so the shape an agent reaches for during a fan-out
+// wave — many gates, one worktree — was the one shape unguarded.
+
+test("THE BUG: a capture wrapper's own `--name <slug>` no longer defeats the guard", () => {
+  assert.equal(isMaskedGate("bash scripts/gate.sh --name probe npm run lint | tail -0"), true);
+});
+
+test("a wrapper's leading options are consumed whatever their shape", () => {
+  for (const c of [
+    "bash scripts/gate.sh --name probe npm run lint | tail -0",
+    "scripts/gate.sh --name jest-guardrails npm test | head -20",
+    // `--opt=value` carries its value in one token. No arity to guess.
+    "bash scripts/gate.sh --name=probe npm test | tail -5",
+    // A boolean flag: the value token must NOT be eaten, or the gate goes with it.
+    "bash scripts/gate.sh -q npm test | tail -5",
+    "bash scripts/gate.sh --quiet --name probe npm run type-check | grep error",
+    // An explicit end-of-options marker.
+    "bash scripts/gate.sh -- npm test | wc -l",
+    // Composed with the other wrappers, in both orders.
+    "bash scripts/gate.sh --name probe timeout 900 npm test | tail -4",
+    "timeout 900 bash scripts/gate.sh --name probe npm test | tail -4",
+  ]) {
+    assert.equal(isMaskedGate(c), true, c);
+  }
+});
+
+test("consuming wrapper options changes nothing about the unpiped and hatch cases", () => {
+  assert.equal(isMaskedGate("bash scripts/gate.sh --name probe npm run lint"), false);
+  assert.equal(isMaskedGate("bash scripts/gate.sh --name probe npm test > gate.log 2>&1; echo EXIT:$?"), false);
+  assert.equal(
+    isMaskedGate("set -o pipefail; bash scripts/gate.sh --name probe npm test | tail -5"),
+    false,
+  );
+  // A wrapper option in front of something that is not a gate is still not a gate.
+  assert.equal(isMaskedGate("bash scripts/gate.sh --name probe ls | tail -5"), false);
+  // A help lookup runs no gate, so there is still no verdict for the pipe to mask.
+  assert.equal(isMaskedGate("bash scripts/gate.sh --help | head -20"), false);
+});
+
+test("option stripping is scoped to the wrapper — a bare leading option is not a gate", () => {
+  assert.equal(stripLeadingWrappers("bash scripts/gate.sh --name probe npm test"), "npm test");
+  assert.equal(stripLeadingWrappers("bash scripts/gate.sh --name=probe npm test"), "npm test");
+  assert.equal(stripLeadingWrappers("bash scripts/gate.sh -q npm test"), "npm test");
+  assert.equal(stripLeadingWrappers("bash scripts/gate.sh -- npm test"), "npm test");
+  assert.equal(isGateStage("bash scripts/gate.sh --name probe npm test"), true);
+  // Not a wrapper invocation: nothing here strips a leading option off a bare command.
+  assert.equal(stripLeadingWrappers("--name probe npm test"), "--name probe npm test");
+  assert.equal(isGateStage("--name probe npm test"), false);
+  assert.equal(isMaskedGate("--name probe npm test | tail -5"), false);
+});
+
 test("a consumer can name a differently-spelled wrapper without forking the guard", () => {
   const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
   try {
