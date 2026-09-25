@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -37,6 +37,34 @@ import { createEngineHarness, posix, type Harness } from '../harness/engine.js';
  */
 
 let h: Harness;
+
+/**
+ * Why the symlink case cannot run on this host, or null when it can.
+ *
+ * Creating a symlink on Windows needs Developer Mode or an elevated process;
+ * without either, Node's symlinkSync throws EPERM and the case would fail on
+ * the FIXTURE, never reaching the guard it exists to test (DnD-gspjs). Only that
+ * exact combination skips — any other error, or any other platform, still runs
+ * the case (and fails loudly if the fixture breaks), so this can never turn a
+ * Linux regression green.
+ */
+function symlinkSkipReason(): string | null {
+  if (process.platform !== 'win32') return null;
+  const probe = mkdtempSync(path.join(tmpdir(), 'cicd-symlink-probe-'));
+  try {
+    mkdirSync(path.join(probe, 'target'));
+    symlinkSync(path.join(probe, 'target'), path.join(probe, 'link'), 'dir');
+    return null;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EPERM') {
+      return 'win32 without symlink privilege (EPERM) — enable Developer Mode or run elevated to exercise this case; Linux CI runs it';
+    }
+    throw e;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+const SYMLINK_SKIP = symlinkSkipReason();
 
 beforeAll(() => {
   h = createEngineHarness({ prNumber: 8361 });
@@ -111,6 +139,27 @@ describe('apply_fixes containment', () => {
     expect(r.applied.trim()).toBe('');
   });
 
+  // Windows spellings of "absolute", rejected on EVERY host (DnD-gspjs). The
+  // engine also runs under Git Bash on Windows runners, where MSYS resolves each
+  // of these outside WORK_DIR; the lexical layer used to test only a leading
+  // `/`, so a `C:\...` path from the model was written. On Linux they are
+  // nonsense names no real fix uses, so rejecting them costs nothing there.
+  it.each([
+    ['a drive letter with a backslash', 'C:\\Windows\\pwned.txt'],
+    ['a drive letter with a forward slash', 'C:/Windows/pwned.txt'],
+    ['a drive-relative path', 'c:pwned.txt'],
+    ['a leading backslash', '\\Windows\\pwned.txt'],
+    ['a UNC path', '\\\\server\\share\\pwned.txt'],
+    ['a forward-slash UNC path', '//server/share/pwned.txt'],
+    ['a backslash `..` traversal', 'a\\..\\..\\pwned.txt'],
+  ])('rejects %s at the lexical layer', (_label, p) => {
+    const r = runFix(p);
+    expect(r.out).toMatch(/REJECTED .* \(path escapes the PR checkout\)/);
+    expect(r.dropped).toMatch(/REJECTED: path outside the PR checkout/);
+    expect(r.applied.trim()).toBe('');
+    expect(existsSync(path.join(r.dir, 'pwned.txt'))).toBe(false);
+  });
+
   it('rejects a parent-directory escape', () => {
     const r = runFix('../pwned.txt');
     expect(existsSync(path.join(r.dir, 'pwned.txt'))).toBe(false);
@@ -124,7 +173,8 @@ describe('apply_fixes containment', () => {
     expect(r.dropped).toMatch(/outside the PR checkout/);
   });
 
-  it('rejects a symlink escape that is lexically clean', () => {
+  it('rejects a symlink escape that is lexically clean', (ctx) => {
+    ctx.skip(SYMLINK_SKIP !== null, SYMLINK_SKIP ?? undefined);
     // `linkdir/x` is neither absolute nor contains `..` — only the RESOLVED
     // check catches it. This is precisely what a lexical guard cannot see, and
     // why shipping only the lexical half would have read as done.

@@ -345,7 +345,12 @@ load_protection_contexts() {
     | map(select(. != null)) | unique | .[]
   ' 2>/dev/null)" || return 0
 
-  protection_contexts="$parsed"
+  # Strip CRs: a NATIVE Windows jq (the usual one under Git Bash) writes CRLF
+  # line endings, and `$( )` only drops the LAST one — so every context but the
+  # final one kept a trailing \r and never matched the check-run names below
+  # (DnD-gspjs: a present 'ci' was reported as "never reported"). No real
+  # context name contains a CR, so this is a no-op on Linux.
+  protection_contexts="${parsed//$'\r'/}"
   if [ -n "$protection_contexts" ]; then
     protection_state="ok"
   else
@@ -534,6 +539,9 @@ while IFS=$'\t' read -r pr sha head_ref base_ref merge_state; do
       | map(select(.name | startswith($reviewer) | not))
       | .[].name
     ' 2>/dev/null)" || check_names=""
+    # Same CRLF hazard as protection_contexts (see load_protection_contexts):
+    # compare CR-free names on both sides.
+    check_names="${check_names//$'\r'/}"
     missing_context=""
     while IFS= read -r ctx; do
       [ -n "$ctx" ] || continue

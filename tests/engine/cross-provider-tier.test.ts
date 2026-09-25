@@ -64,17 +64,28 @@ afterAll(() => h.cleanup());
  * STUB_HTTP_<PROVIDER> (default 200); `unreachable` makes curl exit 7 the way a
  * DNS/connect failure does. One line per request goes to the curl log, in
  * order, naming the provider, the Authorization header and the payload knobs.
+ *
+ * The Authorization header is read wherever curl itself would find it: inline
+ * (`-H 'Authorization: ...'`), from a file (`-H @path`) or from stdin
+ * (`-H @-`). The engine uses stdin so the credential stays out of argv
+ * (DnD-g5eiv); resolving all three forms here keeps these cases about the
+ * header ARRIVING, while llm-key-argv.test.ts pins where it must NOT be.
  */
 const CURL_STUB = `
 curl() {
-  local out="" pay="" prev="" url="" auth="none" a
+  local out="" pay="" prev="" url="" auth="none" a hdr
   for a in "$@"; do
     if [ "$prev" = "-o" ]; then out="$a"; fi
+    if [ "$prev" = "-d" ]; then pay="\${a#@}"; fi
     if [ "$prev" = "-H" ]; then
-      case "$a" in Authorization:*) auth="$a" ;; esac
+      case "$a" in
+        @-) hdr="$(cat)" ;;
+        @*) hdr="$(cat "\${a#@}")" ;;
+        *) hdr="$a" ;;
+      esac
+      case "$hdr" in Authorization:*) auth="$hdr" ;; esac
     fi
     case "$a" in
-      @*) pay="\${a#@}" ;;
       https://*) url="$a" ;;
     esac
     prev="$a"
