@@ -1,0 +1,11 @@
+# Every text file is LF in the index AND in every working tree, whatever the
+# checkout's core.autocrlf says (DnD-gspjs).
+#
+# Without this, a Windows checkout with core.autocrlf=true materialised CRLF
+# into files that bash, jq and the tests read directly: tests/profiles/*.env
+# (a `CICD_STRICT_SKIPPED=false\r` value), engine/*.sh, engine/ci-status.jq and
+# tests/engine/legacy/*.sh. Linux CI never saw it, so the suite was green there
+# and nine specs were red on a Windows machine for reasons unrelated to the code.
+* text=auto eol=lf
+
+# No binary assets are tracked today; list any added later here as `binary`.
