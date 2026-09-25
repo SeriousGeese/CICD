@@ -410,6 +410,104 @@ describe('trigger 3 — wedged mergeability', () => {
   });
 });
 
+/**
+ * CRLF from jq (DnD-gspjs). A NATIVE Windows jq — the usual one under Git
+ * Bash — ends every `-r` line with CRLF, and bash's `$( )` removes only the
+ * trailing newline(s), so each context/name but (on MSYS) the last keeps a
+ * `\r`. Before the fix, `'ci\r'` never matched `ci` and a present required
+ * context was reported as "never reported", i.e. a real sweep was refused.
+ *
+ * These cases must bite on LINUX too, so they do not rely on a native jq: a
+ * `jq` shell function, loaded through BASH_ENV (the sweep runs as its own bash
+ * process), appends a CR to every output line of the two filters the guard
+ * compares — the required-contexts read and the check-run-names read —
+ * according to STUB_JQ_CRLF (`both`, `protection` or `names`). Every other jq
+ * call is untouched. One-sided CRLF is the shape that actually diverges: on
+ * MSYS grep reads its INPUT lines without the CR while the pattern keeps it,
+ * so the two lists disagree even when both came out of jq with CRLF.
+ */
+describe('required-context matching tolerates CRLF jq output (DnD-gspjs)', () => {
+  const shimDir = mkdtempSync(join(tmpdir(), 'sweep-jq-crlf-'));
+  const shim = join(shimDir, 'jq-crlf.bash');
+  writeFileSync(
+    shim,
+    `jq() {
+  local mode=""
+  case "$*" in
+    *required_status_checks.contexts*) mode=protection ;;
+    *'startswith($reviewer)'*) mode=names ;;
+  esac
+  if [ -n "$mode" ] && { [ "\${STUB_JQ_CRLF:-}" = both ] || [ "\${STUB_JQ_CRLF:-}" = "$mode" ]; }; then
+    command jq "$@" | sed 's/\\r*$/\\r/'
+  else
+    command jq "$@"
+  fi
+}
+# Byte-exact line matching on every host. Linux GNU grep already compares a
+# line's CR; Git Bash's grep drops a trailing CR from its INPUT lines unless
+# -U is given, which would mask the check-names half of the defect on Windows.
+grep() { command grep -U "$@"; }
+`,
+  );
+  const shimEnv = (mode: string) => ({ BASH_ENV: shim.split('\\').join('/'), STUB_JQ_CRLF: mode });
+
+  const bothRequired = { protection: { required_status_checks: { contexts: ['ci', 'e2e'] } } };
+  const bothGreen = {
+    check_runs: [
+      { id: 1, name: 'ci', status: 'completed', conclusion: 'success', completed_at: '2020-01-01T00:00:00Z' },
+      { id: 2, name: 'e2e', status: 'completed', conclusion: 'success', completed_at: '2020-01-01T00:00:00Z' },
+    ],
+  };
+  const wedgedFx = (fx: Fixtures): Fixtures => ({
+    prs: openPr({ mergeStateStatus: 'BLOCKED' }),
+    runs: reviewRun({ run_started_at: '2026-09-08T10:00:00Z', conclusion: 'success', run_attempt: 1 }),
+    comments: [
+      {
+        id: 5,
+        body: [
+          'PR Auto-Review Summary',
+          '```yaml',
+          `  pr_head_sha: ${SHA}`,
+          '  merge_attempts: 0',
+          '  merge_error: GitHub reported: mergeStateStatus=BLOCKED after 300s',
+          '```',
+        ].join('\n'),
+      },
+    ],
+    ...fx,
+  });
+
+  it('the shim really emits CRLF for the filter it targets (so the cases below are not vacuous)', () => {
+    const out = execFileSync(
+      'bash',
+      ['-c', `printf '%s' '${JSON.stringify(bothRequired)}' | jq -r '.protection.required_status_checks.contexts[]'`],
+      { encoding: 'utf8', env: { ...process.env, ...shimEnv('protection') } },
+    );
+    expect(out).toBe('ci\r\ne2e\r\n');
+  });
+
+  it.each(['both', 'protection', 'names'])(
+    'does NOT report a present required context as never-reported (CRLF on %s)',
+    (mode) => {
+      const { stdout } = run(wedgedFx({ branch: bothRequired, checkRuns: bothGreen }), shimEnv(mode));
+      expect(stdout).not.toContain('never reported');
+      expect(stdout).toContain('wedged mergeability verdict');
+      expect(stdout).toContain('would re-run review run 900');
+    },
+  );
+
+  it('still names a genuinely missing context cleanly — no CR in the verdict (CRLF on both)', () => {
+    const { stdout } = run(
+      wedgedFx({ branch: bothRequired, checkRuns: greenCi('2020-01-01T00:00:00Z') }),
+      shimEnv('both'),
+    );
+    expect(stdout).toContain("required context 'e2e' never reported");
+    expect(stdout).not.toContain("'ci' never reported");
+    expect(stdout).not.toContain('\r');
+    expect(stdout).not.toContain('would re-run');
+  });
+});
+
 describe('the reviewer check-run prefix', () => {
   it('excludes the reviewer’s own check run from the CI settle time', () => {
     // A reviewer job whose name falls outside the prefix is invisible AS a
