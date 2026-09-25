@@ -154,6 +154,33 @@ describe('composite actions', () => {
     expect(engine).toMatch(/\$\{PR_REVIEW_LLM_MAX_TIME:-\d+\}/);
   });
 
+  it('pr-review forwards the cross-provider tier inputs, each defaulting to EMPTY', () => {
+    // DnD-jc8my. Empty defaults are the "behaves exactly as before" guarantee:
+    // an unwired switch is off, unwired endpoint/model inputs keep the engine
+    // defaults, and an unwired token leaves the GitHub Models arm out of the
+    // draw. Each input must also reach the NAME the engine reads — a renamed
+    // env var turns the input into configuration that does nothing.
+    const yml = readFileSync(path.join(actionsDir, 'pr-review', 'action.yml'), 'utf8');
+    const engine = readFileSync(path.join(repoRoot, 'engine', 'pr-review.sh'), 'utf8');
+    const wiring: Array<[string, string]> = [
+      ['cross-provider-tier', 'PR_REVIEW_CROSS_PROVIDER'],
+      ['sasquatch-endpoint', 'SASQUATCH_ENDPOINT'],
+      ['sasquatch-model', 'SASQUATCH_MODEL'],
+      ['github-models-token', 'GITHUB_MODELS_TOKEN'],
+      ['github-models-model', 'GITHUB_MODELS_MODEL'],
+    ];
+    for (const [input, envName] of wiring) {
+      const at = yml.indexOf(`  ${input}:`);
+      expect(at, `inputs.${input} is declared`).toBeGreaterThan(-1);
+      const def = yml.slice(at).match(/default:\s*(.*)/)?.[1]?.trim();
+      expect(def, `inputs.${input} default`).toMatch(/^(''|"")$/);
+      expect(yml).toMatch(new RegExp(`^\\s+${envName}: \\$\\{\\{ inputs\\.${input} \\}\\}$`, 'm'));
+      // Read with a colon-dash fallback, so the empty string an unwired input
+      // arrives as means "unset" rather than a literal empty value.
+      expect(engine).toMatch(new RegExp(`${envName}="\\$\\{${envName}:-`));
+    }
+  });
+
   it('ci-gate refuses an empty required-jobs list', () => {
     // A gate that passes unconditionally is worse than no gate: it looks like
     // protection. Pinned here as well as in ci-gate.test.mjs because the action

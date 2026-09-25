@@ -26,7 +26,8 @@ GH_CLI="${GH_CLI:-gh}"
 : "${REPO:?}" "${WORK_DIR:?}"
 : "${GH_TOKEN:?}"
 
-# LLM chain: OpenRouter primary (paid) → OpenRouter free fallback. The former
+# LLM chain: OpenRouter primary (paid) → cross-provider advisory tier (opt-in,
+# below) → OpenRouter free fallback. The former
 # local (Lemonade/llama.cpp) reviewer tier was removed — running inference on
 # the runner host caused local system instability, and OpenRouter already
 # covered every prompt the local tier could not.
@@ -34,6 +35,53 @@ GH_CLI="${GH_CLI:-gh}"
 : "${OPENROUTER_MODEL:=deepseek/deepseek-v4-flash}"
 : "${OPENROUTER_FALLBACK_MODEL:=nvidia/nemotron-3-super-120b-a12b:free}"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+
+# ── Cross-provider advisory tier (DnD-jc8my) ───────────────────────────────
+# Both tiers above are OpenRouter, so one provider stall takes out the whole
+# chain. This tier sits BETWEEN them — openrouter → cross-provider →
+# openrouter-free — and is served by a different provider entirely. It is
+# ADVISORY-ONLY: it is deliberately absent from PAID_LLM_TIERS below, so a
+# review it produces may comment (and a clean one still merges) but never
+# auto-applies a fix; a finding becomes a suggestion.
+#
+# TWO ARMS, CHOSEN AT RANDOM PER CALL — not an ordered fallback (product
+# decision on DnD-c38po, 2026-09-21). Do not "simplify" this into a chain: the
+# random draw is what gives the later comparison (DnD-ne83x) a like-for-like
+# sample of the two providers. The arm that was NOT drawn is still tried when
+# the drawn one fails, so an unprovisioned (HTTP 403) or unreachable arm
+# degrades to the other rather than failing the tier; only when both fail does
+# the chain move on to openrouter-free. Which arm served — and which was drawn —
+# is recorded in the review metadata (llm_tier: cross-provider:<arm>,
+# llm_arm_drawn: <arm>), because without it the sample cannot be attributed.
+#
+#   sasquatch      Self-hosted OpenAI-compatible endpoint. No credential, $0.
+#                  Keep it on a NON-thinking model: a thinking model's <think>
+#                  preamble broke JSON mode on the old local tier (DnD-gmjb).
+#   github-models  GitHub Models inference, authenticated with a GITHUB_TOKEN
+#                  that holds `models: read`. Free up to a usage limit, and its
+#                  free tier caps a request's input/output tokens far below a
+#                  large review, so a big diff is expected to fall to the other
+#                  arm. An org that is not provisioned answers 403, which
+#                  degrades the same way.
+#
+# OFF unless PR_REVIEW_CROSS_PROVIDER=true, so a caller that passes none of the
+# new inputs gets exactly the two-tier chain it had before. Each arm also needs
+# its own prerequisite — an endpoint for sasquatch, a token for github-models —
+# and an arm missing one is simply not in the draw. Empty values are treated as
+# unset throughout (`:-`), because an action input that was not wired arrives
+# as the empty string, not as an absent name.
+PR_REVIEW_CROSS_PROVIDER="${PR_REVIEW_CROSS_PROVIDER:-false}"
+SASQUATCH_ENDPOINT="${SASQUATCH_ENDPOINT:-https://llm.sasquatch.dev/v1/chat/completions}"
+SASQUATCH_MODEL="${SASQUATCH_MODEL:-Qwen3-Coder-30B-A3B-Instruct-GGUF}"
+GITHUB_MODELS_ENDPOINT="${GITHUB_MODELS_ENDPOINT:-https://models.github.ai/inference/chat/completions}"
+GITHUB_MODELS_MODEL="${GITHUB_MODELS_MODEL:-openai/gpt-4o-mini}"
+GITHUB_MODELS_TOKEN="${GITHUB_MODELS_TOKEN:-}"
+# The free GitHub Models tier rejects a request asking for more output tokens
+# than its per-request cap, so this arm asks for less than call_llm's default.
+GITHUB_MODELS_MAX_TOKENS="${GITHUB_MODELS_MAX_TOKENS:-4000}"
+# Test seam: force the draw to one arm instead of rolling for it. The other arm
+# is still the fallback, exactly as after a real draw.
+PR_REVIEW_CROSS_PROVIDER_ARM="${PR_REVIEW_CROSS_PROVIDER_ARM:-}"
 
 # Authors whose PRs get auto-fix pushes and auto-merge. Everyone else gets a
 # review comment only (no pushes to their branch, no merge). "*" opens it up.
@@ -71,12 +119,18 @@ BOT_EMAIL="strickdd@gmail.com"
 WORK_DIR="${WORK_DIR}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Strips CR/LF/tab/stray whitespace from OPENROUTER_API_KEY. curl silently drops a
-# header containing a newline, which presents as a 401 from the provider — a real
-# incident in promptci-cloud (#142) that cost a day, and one neither DnD nor
-# PromptCI is protected from today.
+# Strips CR/LF/tab/stray whitespace from every credential the LLM tiers send.
+# curl silently drops a header containing a newline, which presents as a 401 from
+# the provider — a real incident in promptci-cloud (#142) that cost a day.
+#
+# Until DnD-jc8my this comment promised OPENROUTER_API_KEY was sanitised while
+# nothing ever called the function on it: the file was sourced and the key was
+# used raw. Both keys are now actually passed through it, and a test sends a
+# newline-carrying key through the real call_llm to prove the header survives.
 # shellcheck source=./sanitize-secret.sh
 source "${SCRIPT_DIR}/sanitize-secret.sh"
+OPENROUTER_API_KEY="$(sanitize_secret "$OPENROUTER_API_KEY")"
+GITHUB_MODELS_TOKEN="$(sanitize_secret "$GITHUB_MODELS_TOKEN")"
 
 # Provides required_contexts() and ci_status_json() — the two shell-side seams
 # around ci-status.jq, which is now the single reduction every CI verdict in this
@@ -233,6 +287,10 @@ DEFAULT_BRANCH_CACHE=""
 LLM_USED_TIER="none"
 LLM_USED_MODEL="none"
 LLM_USED_ENDPOINT="none"
+# Which cross-provider arm the random draw picked (DnD-jc8my). Differs from the
+# arm in LLM_USED_TIER exactly when the drawn arm failed and the other served —
+# the degraded case DnD-ne83x has to be able to tell apart from a clean draw.
+LLM_ARM_DRAWN="none"
 # Review-call telemetry (set by review_llm; surfaced in the PR comment's
 # metadata YAML). A review that "passed" in 3 seconds on 40 prompt tokens is
 # a rubber stamp — these make that visible per PR instead of only in runner
@@ -263,6 +321,10 @@ LLM_CALL_SECONDS=0
 # lookup does: "none", an empty tier, a tier added to the chain later and not
 # listed here, and a listed tier that resolved to a `:free` model id are all
 # treated as free. Widening it is a deliberate act, not an oversight.
+#
+# The cross-provider tier (DnD-jc8my) is NOT listed, and must not be: it is
+# advisory by design, and its LLM_USED_TIER values (`cross-provider:<arm>`) fall
+# through to the fail-closed default above.
 PAID_LLM_TIERS="openrouter"
 
 # 0 when $LLM_USED_TIER is positively identified as a tier allowed to auto-apply.
@@ -290,6 +352,12 @@ llm_tier_header_line() {
   case "${LLM_USED_TIER:-none}" in
     ''|none)
       printf '**Reviewer:** ⚠️ no LLM tier completed a review.'
+      ;;
+    cross-provider:*)
+      # Not "FREE tier": the point a reader needs is that this tier is advisory
+      # by design (DnD-jc8my), not that it happened to cost nothing.
+      printf '**Reviewer:** ⚠️ `%s` tier — `%s` (ADVISORY cross-provider tier: findings are NEVER auto-applied — weigh them yourself before acting).' \
+        "$LLM_USED_TIER" "${LLM_USED_MODEL:-none}"
       ;;
     *)
       if llm_tier_is_paid; then
@@ -1451,6 +1519,9 @@ push_review_commits() {
 call_llm() {
   local endpoint="$1" model="$2" api_key="$3" system_prompt="$4" user_content="$5"
   local json_mode="${6:-false}"
+  # Optional 7th argument: the output-token budget. Only the github-models arm
+  # passes one (its free tier refuses a larger ask); everyone else keeps 16384.
+  local max_tokens="${7:-16384}"
   local http_code body_file user_file payload_file
   body_file="$(mktemp "/tmp/pr-review-llm-body-${PR_NUMBER}-XXXXXX")"
   user_file="$(mktemp "/tmp/pr-review-llm-user-${PR_NUMBER}-XXXXXX")"
@@ -1484,6 +1555,7 @@ call_llm() {
     --arg model "$model" \
     --arg system "$system_prompt" \
     --argjson json_mode "$json_mode" \
+    --argjson max_tokens "$max_tokens" \
     '{
       model: $model,
       messages: [
@@ -1491,7 +1563,7 @@ call_llm() {
         {role: "user", content: .}
       ],
       temperature: 0.1,
-      max_tokens: 16384
+      max_tokens: $max_tokens
     } + (if $json_mode then {response_format: {type: "json_object"}} else {} end)' \
   < "$user_file" > "$payload_file" || { rm -f "$body_file" "$user_file" "$payload_file"; return 1; }
   rm -f "$user_file"
@@ -1564,16 +1636,149 @@ sys.exit(0 if c and c.strip() else 1)
   rm -f "$body_file"
 }
 
+# Make ONE attempt at a review on one endpoint/model, and validate it. On
+# success writes the parsed fixes JSON to $FIXES_FILE, sets LLM_USED_*, and
+# returns 0; on any failure — transport, HTTP, unparseable, or not credible —
+# logs why and returns 1. The caller decides what "next" means: the next tier
+# for the ordered chain, the other arm inside the cross-provider tier.
+#
+#   attempt_llm_review <name> <endpoint> <model> <api_key> <json_mode> \
+#                      <system_prompt> <user_content> [max_tokens]
+attempt_llm_review() {
+  local name="$1" endpoint="$2" model="$3" key="$4" json_mode="$5"
+  local system_prompt="$6" user_content="$7" max_tokens="${8:-}"
+  local json
+
+  log "  Tier '${name}': ${model} @ ${endpoint}"
+  local call_started="$SECONDS"
+  if ! call_llm "$endpoint" "$model" "$key" "$system_prompt" "$user_content" "$json_mode" ${max_tokens:+"$max_tokens"} > "$RESPONSE_FILE"; then
+    log "  Tier '${name}' failed after $((SECONDS - call_started))s"
+    return 1
+  fi
+  local call_seconds=$((SECONDS - call_started))
+
+  json="$("$PYTHON_BIN" "$(python_path "$SCRIPT_DIR/extract-fixes.py")" "$(python_path "$RESPONSE_FILE")" 2>/dev/null || echo '{}')"
+  if echo "$json" | jq -e 'has("fixes")' >/dev/null 2>&1 && [ -n "$json" ] && [ "$json" != "{}" ]; then
+    # Structural validity beyond "JSON with a fixes key" (DnD-gbw3s): a
+    # review that returns fixes:[] AND cannot even summarize what the PR
+    # does did not read the diff — treat it as no review and fall through
+    # to the next tier rather than rubber-stamping the merge gate.
+    local summary_text
+    summary_text="$(echo "$json" | jq -r '.summary // ""' 2>/dev/null | tr -d '[:space:]')"
+    if [ -z "$summary_text" ]; then
+      log "  Tier '${name}' returned review JSON with an empty summary — not a credible review"
+      return 1
+    fi
+    printf '%s' "$json" > "$FIXES_FILE"
+    LLM_USED_TIER="$name"
+    LLM_USED_MODEL="$model"
+    LLM_USED_ENDPOINT="$endpoint"
+    LLM_CALL_SECONDS="$call_seconds"
+    local response_tool_path
+    response_tool_path="$(python_path "$RESPONSE_FILE")"
+    LLM_PROMPT_TOKENS="$(jq -r '.usage.prompt_tokens // 0' "$response_tool_path" 2>/dev/null || echo 0)"
+    LLM_COMPLETION_TOKENS="$(jq -r '.usage.completion_tokens // 0' "$response_tool_path" 2>/dev/null || echo 0)"
+    log "  Tier '${name}' produced a valid review (${call_seconds}s, ${LLM_PROMPT_TOKENS} prompt / ${LLM_COMPLETION_TOKENS} completion tokens)"
+    return 0
+  fi
+
+  log "  Tier '${name}' returned 200 but no parseable review JSON"
+  "$PYTHON_BIN" -c "
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d['choices'][0]['message']['content'][:300])
+except Exception:
+    pass
+" "$(python_path "$RESPONSE_FILE")" 2>/dev/null | while IFS= read -r line; do log "    | ${line}"; done
+  return 1
+}
+
+# The cross-provider arms that can take part in THIS run, one per line, in a
+# fixed order. An arm missing its prerequisite is not in the draw at all, which
+# is what lets the github-models arm "simply start participating" once the org
+# is provisioned and the caller passes a token — no engine change needed.
+cross_provider_arms() {
+  [ -n "$SASQUATCH_ENDPOINT" ] && [ -n "$SASQUATCH_MODEL" ] && echo sasquatch
+  [ -n "$GITHUB_MODELS_TOKEN" ] && [ -n "$GITHUB_MODELS_MODEL" ] && echo github-models
+  return 0
+}
+
+# The advisory cross-provider tier (DnD-jc8my; see the configuration block at
+# the top). Draws ONE arm at random; if it fails for any reason, degrades to the
+# other before giving up. LLM_USED_TIER records the arm that SERVED as
+# `cross-provider:<arm>`, and LLM_ARM_DRAWN the arm the draw picked.
+review_cross_provider() {
+  local system_prompt="$1" user_content="$2"
+  local -a arms order
+  mapfile -t arms < <(cross_provider_arms)
+  if [ "${#arms[@]}" -eq 0 ]; then
+    log "  Tier 'cross-provider': skipped — no arm is configured (sasquatch needs an endpoint, github-models a token)"
+    return 1
+  fi
+
+  # Drawn in THIS shell, not in a $( ) subshell, so $RANDOM advances the
+  # run's own sequence. PR_REVIEW_CROSS_PROVIDER_ARM forces the draw (a test
+  # seam) — but only to an arm that is actually available; naming one that is
+  # not falls back to a real draw rather than to an arm with no credentials.
+  local drawn="" a
+  if [ -n "$PR_REVIEW_CROSS_PROVIDER_ARM" ]; then
+    for a in "${arms[@]}"; do
+      [ "$a" = "$PR_REVIEW_CROSS_PROVIDER_ARM" ] && drawn="$a"
+    done
+  fi
+  [ -n "$drawn" ] || drawn="${arms[RANDOM % ${#arms[@]}]}"
+  order=("$drawn")
+  for a in "${arms[@]}"; do
+    [ "$a" = "$drawn" ] || order+=("$a")
+  done
+  log "  Tier 'cross-provider': drew arm '${drawn}' of [${arms[*]}]"
+
+  for a in "${order[@]}"; do
+    case "$a" in
+      sasquatch)
+        # JSON mode on, as the old local tier had it: this endpoint serves a
+        # non-thinking instruct model, which honours response_format.
+        attempt_llm_review "cross-provider:sasquatch" "$SASQUATCH_ENDPOINT" "$SASQUATCH_MODEL" "" \
+          true "$system_prompt" "$user_content" && { LLM_ARM_DRAWN="$drawn"; return 0; }
+        ;;
+      github-models)
+        attempt_llm_review "cross-provider:github-models" "$GITHUB_MODELS_ENDPOINT" "$GITHUB_MODELS_MODEL" \
+          "$GITHUB_MODELS_TOKEN" false "$system_prompt" "$user_content" "$GITHUB_MODELS_MAX_TOKENS" \
+          && { LLM_ARM_DRAWN="$drawn"; return 0; }
+        ;;
+    esac
+    log "  Tier 'cross-provider': arm '${a}' failed — an unprovisioned (403) or unreachable arm degrades to the other"
+  done
+  return 1
+}
+
 # Run the review through the fallback chain. On success, writes the parsed
 # fixes JSON (guaranteed to have a "fixes" key) to $FIXES_FILE and sets
 # LLM_USED_*. Fails only when every tier fails.
+#
+# ORDER IS PINNED BY A TEST: openrouter, then the advisory cross-provider tier,
+# then openrouter-free LAST (DnD-cyr7z). The same-provider free fallback is the
+# tier least likely to survive whatever took out the paid one, so it goes after
+# the tier served by a different provider.
 review_llm() {
   local system_prompt="$1" user_content="$2"
-  local tier name endpoint model key json_mode json
+  local tier name endpoint model key json_mode
+
+  # Per-review state, reset on EVERY call. main()'s converge loop calls this up
+  # to MAX_ITERATIONS times, and only the cross-provider tier ever sets
+  # LLM_ARM_DRAWN — so without the reset, an iteration served by the arm
+  # followed by one served by openrouter reported `llm_tier: openrouter` beside
+  # `llm_arm_drawn: sasquatch`, a pairing that never happened, straight into
+  # DnD-ne83x's sample.
+  LLM_ARM_DRAWN="none"
 
   # tier format: name|endpoint|model|api_key|json_mode
+  # The cross-provider entry is a placeholder: its two arms and their
+  # credentials are resolved per call by review_cross_provider.
   local -a tiers=(
     "openrouter|${OPENROUTER_ENDPOINT}|${OPENROUTER_MODEL}|${OPENROUTER_API_KEY}|false"
+    "cross-provider|-|-|-|-"
     "openrouter-free|${OPENROUTER_ENDPOINT}|${OPENROUTER_FALLBACK_MODEL}|${OPENROUTER_API_KEY}|false"
   )
 
@@ -1586,50 +1791,19 @@ review_llm() {
           continue
         fi
         ;;
+      cross-provider)
+        if [ "$PR_REVIEW_CROSS_PROVIDER" != "true" ]; then
+          continue
+        fi
+        review_cross_provider "$system_prompt" "$user_content" && return 0
+        log "  Tier 'cross-provider': no arm produced a review — trying next tier"
+        continue
+        ;;
     esac
 
-    log "  Tier '${name}': ${model} @ ${endpoint}"
-    local call_started="$SECONDS"
-    if ! call_llm "$endpoint" "$model" "$key" "$system_prompt" "$user_content" "$json_mode" > "$RESPONSE_FILE"; then
-      log "  Tier '${name}' failed after $((SECONDS - call_started))s — trying next tier"
-      continue
-    fi
-    local call_seconds=$((SECONDS - call_started))
-
-    json="$("$PYTHON_BIN" "$(python_path "$SCRIPT_DIR/extract-fixes.py")" "$(python_path "$RESPONSE_FILE")" 2>/dev/null || echo '{}')"
-    if echo "$json" | jq -e 'has("fixes")' >/dev/null 2>&1 && [ -n "$json" ] && [ "$json" != "{}" ]; then
-      # Structural validity beyond "JSON with a fixes key" (DnD-gbw3s): a
-      # review that returns fixes:[] AND cannot even summarize what the PR
-      # does did not read the diff — treat it as no review and fall through
-      # to the next tier rather than rubber-stamping the merge gate.
-      local summary_text
-      summary_text="$(echo "$json" | jq -r '.summary // ""' 2>/dev/null | tr -d '[:space:]')"
-      if [ -z "$summary_text" ]; then
-        log "  Tier '${name}' returned review JSON with an empty summary — not a credible review, trying next tier"
-        continue
-      fi
-      printf '%s' "$json" > "$FIXES_FILE"
-      LLM_USED_TIER="$name"
-      LLM_USED_MODEL="$model"
-      LLM_USED_ENDPOINT="$endpoint"
-      LLM_CALL_SECONDS="$call_seconds"
-      local response_tool_path
-      response_tool_path="$(python_path "$RESPONSE_FILE")"
-      LLM_PROMPT_TOKENS="$(jq -r '.usage.prompt_tokens // 0' "$response_tool_path" 2>/dev/null || echo 0)"
-      LLM_COMPLETION_TOKENS="$(jq -r '.usage.completion_tokens // 0' "$response_tool_path" 2>/dev/null || echo 0)"
-      log "  Tier '${name}' produced a valid review (${call_seconds}s, ${LLM_PROMPT_TOKENS} prompt / ${LLM_COMPLETION_TOKENS} completion tokens)"
-      return 0
-    fi
-
-    log "  Tier '${name}' returned 200 but no parseable review JSON — trying next tier"
-    "$PYTHON_BIN" -c "
-import sys, json
-try:
-    d = json.load(open(sys.argv[1]))
-    print(d['choices'][0]['message']['content'][:300])
-except Exception:
-    pass
-" "$(python_path "$RESPONSE_FILE")" 2>/dev/null | while IFS= read -r line; do log "    | ${line}"; done
+    attempt_llm_review "$name" "$endpoint" "$model" "$key" "$json_mode" "$system_prompt" "$user_content" \
+      && return 0
+    log "  Tier '${name}' did not produce a review — trying next tier"
   done
 
   return 1
@@ -1882,7 +2056,7 @@ review_may_apply_fixes() {
 # recorded at all — i.e. when the author genuinely is not allowlisted.
 fix_skip_reason() {
   if ! llm_tier_is_paid; then
-    printf 'this review ran on the `%s` tier (`%s`), and a free or unidentified tier may comment but never auto-applies a fix (DnD-8fbkq) — a paid-tier re-review or a human has to apply these' \
+    printf 'this review ran on the `%s` tier (`%s`), and a free, advisory or unidentified tier may comment but never auto-applies a fix (DnD-8fbkq) — a paid-tier re-review or a human has to apply these' \
       "${LLM_USED_TIER:-none}" "${LLM_USED_MODEL:-none}"
   elif [ "$HOLD_LABEL" = "$LABEL_LOOKUP_FAILED" ]; then
     printf "this PR's labels could not be read, so the do-not-merge guard failed closed (DnD-m3uj3) — an infrastructure fault holding every PR, not something about this one"
@@ -2508,6 +2682,7 @@ review:
   host: ${RUNNER_HOST:-artemis}
   runner_name: ${RUNNER_NAME:-artemis-pr-review}
   llm_tier: ${LLM_USED_TIER}
+  llm_arm_drawn: ${LLM_ARM_DRAWN}
   model: ${LLM_USED_MODEL}
   model_endpoint: ${LLM_USED_ENDPOINT}
   llm_call_seconds: ${LLM_CALL_SECONDS}
@@ -2801,7 +2976,11 @@ main() {
   log "Repo: ${REPO}"
   log "Branch: ${PR_HEAD_REF} → ${PR_BASE_REF}"
   log "Author: ${PR_AUTHOR} (auto-merge eligible: ${automerge_eligible})"
-  log "LLM chain: ${OPENROUTER_MODEL} → ${OPENROUTER_FALLBACK_MODEL} @ ${OPENROUTER_ENDPOINT}"
+  if [ "$PR_REVIEW_CROSS_PROVIDER" = "true" ]; then
+    log "LLM chain: ${OPENROUTER_MODEL} → cross-provider (advisory; random arm of [$(cross_provider_arms | tr '\n' ' ' | sed 's/ $//')]) → ${OPENROUTER_FALLBACK_MODEL} @ ${OPENROUTER_ENDPOINT}"
+  else
+    log "LLM chain: ${OPENROUTER_MODEL} → ${OPENROUTER_FALLBACK_MODEL} @ ${OPENROUTER_ENDPOINT}"
+  fi
 
   # ── 1. Set up working directory ────────────────────────────────────────
   # The workflow clones the PR branch into WORK_DIR — just cd in and configure.

@@ -99,6 +99,55 @@ action's `llm-max-time` input instead (seconds, applied as `curl --max-time` to
 every tier). Empty keeps the engine default of 180s, so forwarding a repository
 variable that is not defined is safe.
 
+## The LLM tier chain
+
+```
+openrouter  →  cross-provider (advisory, opt-in)  →  openrouter-free
+```
+
+`openrouter-free` is always **last**: it shares a provider with the paid tier, so
+it is the tier least likely to survive whatever took that one out. A test pins the
+order.
+
+Only `openrouter` may auto-apply a fix. Every other tier — including one added
+later and forgotten — is advisory: its review comments, and a clean one still
+merges, but a proposed fix is reported as a suggestion and never applied.
+
+### The cross-provider tier
+
+Off unless the action's `cross-provider-tier` input is `'true'`. With it off, or
+with none of the inputs below wired, the chain is exactly the two OpenRouter tiers.
+
+Each review draws **one of two arms at random**. It is deliberately not an
+ordered fallback: the random draw is what gives a later comparison of the two
+providers a like-for-like sample. The arm that was not drawn is still tried if
+the drawn one fails, so the tier fails only when both do.
+
+| arm | inputs | needs | notes |
+|---|---|---|---|
+| `sasquatch` | `sasquatch-endpoint`, `sasquatch-model` | nothing — no credential | self-hosted; keep it on a **non-thinking** model |
+| `github-models` | `github-models-token`, `github-models-model` | the workflow's `GITHUB_TOKEN` plus `permissions: models: read` | free up to a usage limit; an org that has not enabled GitHub Models answers 403 |
+
+An arm missing its prerequisite is not in the draw at all. Empty endpoint/model
+inputs keep the engine defaults, while an empty `github-models-token` leaves that
+arm out — so it starts taking part the day you pass a token, with no engine
+change. A 403 or an unreachable host on the drawn arm degrades to the other.
+
+GitHub Models' free tier caps a request's input and output tokens far below a
+large review, so expect big diffs to fall through to the sasquatch arm. The arm
+asks for at most 4000 output tokens for the same reason.
+
+**Which arm served is recorded** in the comment's metadata block, because a
+sample that cannot be attributed is no sample:
+
+```yaml
+llm_tier: cross-provider:github-models   # the arm that SERVED
+llm_arm_drawn: sasquatch                 # the arm the draw PICKED
+```
+
+The two differ exactly when the drawn arm failed and the other stepped in.
+`llm_arm_drawn` is `none` for a review no cross-provider arm served.
+
 ### `CICD_STRICT_SKIPPED` — read this before adopting
 
 `ci-status.jq` treats a `skipped` check as a **pass** unless its name is a

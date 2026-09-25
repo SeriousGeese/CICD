@@ -38,6 +38,19 @@ def extract_fixes(llm_response: dict) -> dict:
     if not content:
         return {}
 
+    # A thinking model's reasoning is not the review. Strip <think>…</think>
+    # blocks — and an UNCLOSED one, which is what a model that spent its whole
+    # output budget reasoning leaves behind — before anything below reads the
+    # content. Without this, Strategy 5 would present a truncated chain of
+    # thought as a plain-text "clean review" and the tier would count as having
+    # reviewed the PR. The cross-provider tier's self-hosted arm is meant to
+    # serve a non-thinking model (DnD-jc8my), but that is a variable a caller
+    # can repoint, so the parser must not depend on it.
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+    content = re.sub(r"<think>.*\Z", "", content, flags=re.DOTALL)
+    if not content.strip():
+        return {}
+
     # Strategy 1: Extract from ```json ... ``` code blocks
     m = re.search(r"```json\n?(.*?)\n?```", content, re.DOTALL)
     if m:
