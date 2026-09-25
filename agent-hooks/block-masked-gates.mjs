@@ -89,10 +89,31 @@ const UNITY_CLI = String.raw`unity\s+command\s+(?:--[\w-]+(?:=\S+|\s+(?!run_test
 // path FRAGMENTS (tokens with a slash) may precede the executable.
 const UNITY_BATCH = String.raw`(?:(?:\S*[\\/]\S*\s+)*(?:\S*[\\/])?Unity(?:\.exe)?\s+|-(?:batchmode|projectPath|nographics|quit)\b\s+)(?:\S+\s+)*?-runTests`;
 const DOTNET = String.raw`dotnet\s+(?:test|build)`;
+
+// `node --test`: Node's own built-in test runner (no package under `node_modules`,
+// so NODE_ENTRY above never matches it). The `--test` flag may appear in ANY
+// position among node's own leading flags — `node --test-reporter=tap --test x`,
+// `node --test --test-reporter tap x`, or bare `node --test x.node-test.mjs` — and
+// this repo's own `run-node-tests.mjs` wrapper (see NODE_WRAPPER below) spawns the
+// runner with `--test-reporter` BEFORE `--test`, so the flag position genuinely
+// varies. Matched as a PREFIX (`--test`, `--test-reporter=tap`, `--test-only`, …)
+// so `--test-reporter=…` alone is recognised even without a separate bare `--test`
+// token later in the same command — the guard would rather over-recognise a
+// test-runner invocation than miss one.
+//
+// NODE_FLAGS is reused here (not a fresh `[^\s|]+` scan) specifically so regex
+// backtracking finds `--test` wherever it sits among a run of `--xxx` flags: the
+// engine greedily consumes every leading `--xxx` token, then backs off one
+// repetition at a time until the very next token satisfies NODE_TEST_FLAG — which
+// naturally lands on `--test` regardless of how many other flags precede or follow
+// it, as long as they are all `--xxx`-shaped (real node CLI flags always are).
+const NODE_TEST_FLAG = String.raw`--test(?:-[\w-]+)?(?:=\S+)?\b`;
+const NODE_TEST = String.raw`node\s+${NODE_FLAGS}${NODE_TEST_FLAG}`;
+
 export const GATE = new RegExp(
   String.raw`\b(?:npm\s+(?:run\s+)?(?:test|lint|build|type-?check)|npx\s+${DIRECT_RUNNERS}|yarn\s+(?:test|lint|build|type-?check)|pnpm\s+` +
     PNPM_SELECTORS +
-    String.raw`(?:(?:run\s+)?(?:test|lint|build|type-?check)|(?:exec\s+|dlx\s+)?${DIRECT_RUNNERS})|pnpx\s+${DIRECT_RUNNERS}|${NODE_ENTRY}|${UNITY_CLI}|${UNITY_BATCH}|${DOTNET}|(?:jest|vitest|eslint)(?![-\w])|tsc\s+--noEmit|next\s+build|bd\s+dolt\s+(?:push|pull)|(?:node\s+)?\S*bd-dolt-sync\.mjs\s+(?:push|pull))\b`,
+    String.raw`(?:(?:run\s+)?(?:test|lint|build|type-?check)|(?:exec\s+|dlx\s+)?${DIRECT_RUNNERS})|pnpx\s+${DIRECT_RUNNERS}|${NODE_ENTRY}|${NODE_TEST}|${UNITY_CLI}|${UNITY_BATCH}|${DOTNET}|(?:jest|vitest|eslint)(?![-\w])|tsc\s+--noEmit|next\s+build|bd\s+dolt\s+(?:push|pull)|(?:node\s+)?\S*bd-dolt-sync\.mjs\s+(?:push|pull))\b`,
 );
 export const MASK = /\|\s*(?:tail|head|grep|rg|wc)\b/;
 
@@ -246,6 +267,46 @@ function gateWrapperPrefix() {
   return re;
 }
 
+// ── A wrapper invoked through the NODE interpreter is a different shape ─────
+//
+// `gate.sh` (above) takes a nested GATE COMMAND as its argument and re-execs it —
+// `bash scripts/gate.sh npm test` — so stripping the wrapper's own name and
+// re-checking the remainder against GATE_AT_START is correct: the remainder IS
+// another gate invocation.
+//
+// A wrapper reached through `node` is not that shape. `node
+// scripts/run-node-tests.mjs test:hooks scripts/hooks/*.node-test.mjs` takes a
+// LABEL and a glob, never a nested `npm test`-shaped command — the wrapper runs
+// `node --test` itself, internally, via child_process. Stripping the wrapper name
+// and re-checking the remainder would look for a gate in "test:hooks
+// scripts/hooks/*.node-test.mjs" and correctly find none, which is exactly how
+// this class of gate went unrecognised in the first place. So a registered
+// wrapper reached via `node [<flags>] [<path>/]<wrapper>` is matched as a gate
+// DIRECTLY — the invocation itself IS the gate, full stop, with no recursion into
+// its own arguments.
+//
+// Same basename list, same env var (`AGENT_HOOKS_GATE_WRAPPERS`), so a consumer
+// registers a name once and it is recognised under either interpreter — a
+// consumer that wants `run-node-tests.mjs` recognised as a `gate.sh`-style
+// capture wrapper too (nesting a nested command) gets that for free, since the
+// basename list is shared; whether that shape is ever actually invoked that way
+// is up to the consumer.
+let nodeWrapperCache = { key: null, re: null };
+
+/** `^node [<flags>] [<path>/]<wrapper>\b` for the configured wrapper basenames. */
+function nodeWrapperGatePrefix() {
+  const key = process.env.AGENT_HOOKS_GATE_WRAPPERS ?? "";
+  if (nodeWrapperCache.key === key) return nodeWrapperCache.re;
+  const configured = key
+    .split(/[,\s]+/)
+    .filter(Boolean)
+    .filter((n) => !/[\\/]/.test(n));
+  const names = configured.length ? configured : DEFAULT_GATE_WRAPPERS;
+  const re = new RegExp(String.raw`^node\s+${NODE_FLAGS}(?:\S*[\\/])?(?:${names.map(escapeRe).join("|")})\b`);
+  nodeWrapperCache = { key, re };
+  return re;
+}
+
 // ── …and the wrapper's OWN options ───────────────────────────────────────────
 //
 // Stripping the wrapper NAME alone is half a fix, and the other half reopened
@@ -386,7 +447,11 @@ export function isGateStage(stage) {
   // A help lookup (`bd dolt push --help | head`, `dotnet test -h | grep filter`) prints usage and
   // exits without running anything, so there is no verdict for the pipe to mask.
   if (HELP_FLAG.test(command)) return false;
-  return GATE_AT_START.test(command);
+  if (GATE_AT_START.test(command)) return true;
+  // A registered wrapper reached through `node` is not a "strip and recurse"
+  // shape — see nodeWrapperGatePrefix() above — so it is checked separately,
+  // against the stage as a whole rather than a stripped remainder.
+  return nodeWrapperGatePrefix().test(command);
 }
 
 const HELP_FLAG = /(?:^|\s)(?:--help|-h|-\?|\/\?)(?=\s|$)/;

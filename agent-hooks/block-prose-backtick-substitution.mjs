@@ -1,5 +1,11 @@
-// PreToolUse(Bash) hook: block an UNESCAPED backtick in a `bd` or `gh` command, where
-// the arguments are prose rather than shell.
+// PreToolUse(Bash|Monitor) hook: block an UNESCAPED backtick in a `bd` or `gh` command,
+// where the arguments are prose rather than shell.
+//
+// Covers Monitor as well as Bash: command substitution is a property of the SHELL
+// executing the command, not of the tool that submitted it, and Monitor has been
+// measured (see block-bash-double-backslash.mjs) to hand its `command` field to a
+// real shell with the same quoting/escaping semantics as the Bash tool's — a
+// backtick in a Monitor-run `bd`/`gh` segment is substituted exactly the same way.
 //
 // Why: a backtick inside a double-quoted (or unquoted) bash word is command
 // substitution. That is ordinary, correct bash — the problem is where it fires. Issue
@@ -172,7 +178,9 @@ if (process.argv[1] && process.argv[1].endsWith('block-prose-backtick-substituti
     if (process.env.AGENT_HOOKS_ALLOW_PROSE_BACKTICK === '1') process.exit(0);
 
     const input = JSON.parse(readFileSync(0, 'utf8'));
-    if (input?.tool_name && input.tool_name !== 'Bash') process.exit(0);
+    // Registered on the Bash and Monitor matchers — see the header comment for why
+    // Monitor shares this guard's failure mode.
+    if (input?.tool_name && input.tool_name !== 'Bash' && input.tool_name !== 'Monitor') process.exit(0);
 
     const hit = decide(input?.tool_input?.command ?? '');
     if (!hit) process.exit(0);

@@ -70,6 +70,33 @@ test('never blocks the PowerShell tool, which preserves doubled backslashes', ()
   assert.equal(r.status, 0);
 });
 
+// ── Monitor: a separate channel measured to collapse `\\` identically ──────
+test('blocks the Monitor tool exactly like Bash — Monitor measured to collapse `\\\\` the same way', () => {
+  const r = runHook("printf '%s\\n' 'a\\\\b'", { toolName: 'Monitor' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /collapses every/);
+  assert.match(r.stderr, /Monitor tool's/);
+  assert.match(r.stderr, /AGENT_HOOKS_ALLOW_DOUBLE_BACKSLASH/);
+});
+
+test('Monitor with no doubled backslash is allowed', () => {
+  const r = runHook("printf '%s\\n' 'a\\b'", { toolName: 'Monitor' });
+  assert.equal(r.status, 0);
+});
+
+test('the escape hatch also covers Monitor', () => {
+  const r = runHook("printf '%s' 'a\\\\b'", {
+    toolName: 'Monitor',
+    env: { AGENT_HOOKS_ALLOW_DOUBLE_BACKSLASH: '1' },
+  });
+  assert.equal(r.status, 0);
+});
+
+test('a tool_name that is neither Bash nor Monitor nor PowerShell stays unblocked', () => {
+  const r = runHook("printf '%s' 'a\\\\b'", { toolName: 'Write' });
+  assert.equal(r.status, 0);
+});
+
 test('malformed hook input fails open', () => {
   const r = spawnSync(process.execPath, [hook], { input: 'not json', encoding: 'utf8' });
   assert.equal(r.status, 0);
