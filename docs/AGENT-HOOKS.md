@@ -8,10 +8,10 @@ all of them.
 
 | Guard | Blocks |
 |---|---|
-| `block-bash-double-backslash.mjs` | A Bash command containing `\\`, which the Bash tool's handoff collapses to `\` before bash runs it, so the command silently runs as a different string. |
-| `block-pr-body-heredoc.mjs` | A heredoc feeding `gh pr create`/`gh pr edit`, and any command over ~4 KB carrying a heredoc: large heredocs die intermittently in that handoff. |
-| `block-masked-gates.mjs` | A test/lint/build/type-check command piped into `tail`/`head`/`grep`/`Select-Object`/…, which reports the filter's exit code instead of the gate's. Covers npm/pnpm/yarn scripts, jest/vitest/tsc/eslint/playwright, the Unity CLI (`unity command run_tests`/`recompile`), Unity batch mode (`-runTests`) and `dotnet test`/`build`. |
-| `block-prose-backtick-substitution.mjs` | An unescaped backtick in a `bd` or `gh` argument — prose, not shell — where bash reads it as command substitution and silently replaces the backticked word with a command's output (or nothing). Single quotes, `\`` and `--body-file` pass; `$(…)` is untouched. |
+| `block-bash-double-backslash.mjs` | A Bash or Monitor command containing `\\`, which that tool's handoff collapses to `\` before bash runs it, so the command silently runs as a different string. (Measured identically on both channels; a channel that does not reproduce the collapse — PowerShell preserves `\\` intact — must not be added here without its own measurement.) |
+| `block-pr-body-heredoc.mjs` | A heredoc feeding `gh pr create`/`gh pr edit`, and any command over ~4 KB carrying a heredoc: large heredocs die intermittently in that handoff. Bash-scoped only — the large-heredoc failure has not been measured on any other channel. |
+| `block-masked-gates.mjs` | A test/lint/build/type-check command piped into `tail`/`head`/`grep`/`Select-Object`/…, which reports the filter's exit code instead of the gate's. Covers npm/pnpm/yarn scripts, jest/vitest/tsc/eslint/playwright, `node --test` (Node's built-in test runner, the flag recognised in any position) and a consumer's own node-invoked wrapper scripts (`<PREFIX>_GATE_WRAPPERS`, e.g. a `node scripts/run-node-tests.mjs <label> <glob>` shape that is a gate in its own right rather than a nested command to re-parse), the Unity CLI (`unity command run_tests`/`recompile`), Unity batch mode (`-runTests`) and `dotnet test`/`build`. |
+| `block-prose-backtick-substitution.mjs` | An unescaped backtick in a `bd` or `gh` argument — prose, not shell — where bash reads it as command substitution and silently replaces the backticked word with a command's output (or nothing). Single quotes, `\`` and `--body-file` pass; `$(…)` is untouched. Covers Bash and Monitor, for the same reason as `block-bash-double-backslash.mjs` above. |
 
 `refusal-notice.mjs` and `shell-path-lib.mjs` are shared helpers. Repository-specific
 guards (claims, worktrees, issue tracker) stay in their own repositories and may import
@@ -48,8 +48,18 @@ Then register the guards in `.claude/settings.json`:
 
 | Matcher | Guards |
 |---|---|
-| `Bash` | `block-bash-double-backslash.mjs`, `block-pr-body-heredoc.mjs`, `block-prose-backtick-substitution.mjs` |
+| `Bash\|Monitor` | `block-bash-double-backslash.mjs`, `block-prose-backtick-substitution.mjs` |
+| `Bash` | `block-pr-body-heredoc.mjs` |
 | `Bash\|PowerShell` | `block-masked-gates.mjs` |
+
+A consumer that does not use the Monitor tool at all can register the first row on
+`Bash` alone — the guards themselves fail open (exit 0) on any unrecognised
+`tool_name`, so an unused matcher entry costs nothing either way. A consumer whose
+own agents DO use a Monitor-shaped tool should register it on `Bash|Monitor` to get
+the coverage; `block-pr-body-heredoc.mjs` and the PowerShell branch of
+`block-masked-gates.mjs` were not measured against Monitor and are not claimed to
+cover it — see `agent-hooks/block-bash-double-backslash.mjs`'s header comment for
+the measurement methodology if you want to extend one of them.
 
 and run the node:test suites wherever the consumer runs tests:
 `node --test "scripts/hooks/*.node-test.mjs"`.

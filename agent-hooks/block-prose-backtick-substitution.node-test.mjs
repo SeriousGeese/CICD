@@ -90,10 +90,23 @@ test('does not fire on a bd command with no backtick at all', () => {
   assert.equal(runHook('bd show bead-abc --json').status, 0);
 });
 
-test('ignores a non-Bash tool, and honours the escape hatch', () => {
+test('ignores a non-Bash/non-Monitor tool, and honours the escape hatch', () => {
   const cmd = 'bd create "x" -d "see `foo`"';
   assert.equal(runHook(cmd, { toolName: 'PowerShell' }).status, 0);
   assert.equal(runHook(cmd, { env: { AGENT_HOOKS_ALLOW_PROSE_BACKTICK: '1' } }).status, 0);
+});
+
+// Monitor is a separate channel measured (block-bash-double-backslash.mjs) to hand
+// its command to a real shell with the same semantics as the Bash tool — a backtick
+// in a Monitor-run bd/gh segment is command substitution there too.
+test('blocks a Monitor command exactly like Bash', () => {
+  const r = runHook('bd create "x" -d "see `foo`"', { toolName: 'Monitor' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /COMMAND SUBSTITUTION/);
+});
+
+test('Monitor with no backtick is allowed', () => {
+  assert.equal(runHook('bd ready -n 60', { toolName: 'Monitor' }).status, 0);
 });
 
 test('fails OPEN on malformed input — the guard must never break Bash', () => {
