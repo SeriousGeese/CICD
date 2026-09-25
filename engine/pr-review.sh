@@ -2148,7 +2148,17 @@ apply_fixes() {
     # PR the third-party release notes in the body. AUTOMERGE_AUTHORS includes
     # `dependabot[bot]` here, so that content reaches a bot with write access on a
     # self-hosted runner. Reject absolute paths and any `..` segment outright.
-    if [[ "$path" = /* ]] || [[ "/${path}/" == *"/../"* ]]; then
+    #
+    # "Absolute" includes the Windows spellings, on EVERY host (DnD-gspjs): a
+    # drive letter (`C:\x`, `C:/x`, and drive-relative `C:x`), a leading
+    # backslash, and UNC (`\\server\share`, `//server/share`). The engine also
+    # runs under Git Bash on Windows runners, where MSYS resolves every one of
+    # those outside WORK_DIR; on Linux they are merely nonsense paths no real
+    # fix names. Backslashes are folded to `/` for the check only, so a
+    # `a\..\..\x` traversal is caught by the same `..` test.
+    local path_fwd="${path//\\//}"
+    if [[ "$path_fwd" = /* ]] || [[ "$path_fwd" =~ ^[A-Za-z]: ]] \
+       || [[ "/${path_fwd}/" == *"/../"* ]]; then
       log "  REJECTED ${path} (path escapes the PR checkout): ${desc}"
       printf -- '- **%s** (REJECTED: path outside the PR checkout) — %s\n' "$path" "$desc" >> "$DROPPED_FIXES_FILE"
       continue

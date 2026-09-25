@@ -112,7 +112,12 @@ export PATH="${posix(dir)}:$PATH"
 # shellcheck source=/dev/null
 source "${posix(path.join(engineDir, 'pr-review.sh'))}"
 cleanup() { :; }   # the EXIT trap would remove WORK_DIR mid-suite
-GH_CLI=gh
+# The stub by ABSOLUTE path, never by PATH lookup (DnD-gspjs). The PATH entry
+# above is a C:/... path on Windows, which Git Bash cannot resolve, so a bare
+# GH_CLI=gh reached the REAL gh with GH_TOKEN=fake: every call came back 401,
+# both implementations emitted the same api_failed all-zeros verdict, and every
+# "agrees on" case below passed vacuously while only the divergence case failed.
+GH_CLI="${posix(ghStub)}"
 ${overlay}check_ci_status deadbeefcafe 2>/dev/null
 `,
     'utf8',
@@ -218,6 +223,13 @@ describe('check_ci_status: ci-status.jq delegation matches DnD inline jq', () =>
       // equivalence with DnD's implementation means.
       const legacy = verdict('legacy', c.checks, c.rc ?? 0);
       const current = verdict('current', c.checks, c.rc ?? 0, true);
+      // Anti-vacuity: two implementations that both FAILED to read the stub
+      // agree perfectly (all zeros, api_failed). Only the api-failure case may
+      // legitimately look like that.
+      const expectApiFailure = (c.rc ?? 0) !== 0;
+      expect(apiFailed(legacy), `legacy api_failed on "${c.name}" — did it reach the gh stub?`).toBe(
+        expectApiFailure,
+      );
       for (const f of SHARED_FIELDS) {
         expect(current[f], `field '${f}' differs on "${c.name}"`).toStrictEqual(legacy[f]);
       }
