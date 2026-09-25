@@ -99,6 +99,26 @@ describe('review_llm validity', () => {
     expect(review('{"summary": "  \\n ", "fixes": []}')).toContain('rc=1');
   });
 
+  it('does not count a thinking model’s reasoning as a plain-text clean review', () => {
+    // The extractor maps prose onto a summary (the case above), so a response
+    // that is ONLY a <think> block used to read as "reviewed, LGTM". That is the
+    // shape a thinking model leaves when it spends its whole output budget
+    // reasoning — and the cross-provider tier's self-hosted arm serves a model a
+    // caller can repoint (DnD-jc8my).
+    expect(review('<think>Let me look at the diff. The change adds</think>')).toContain('rc=1');
+  });
+
+  it('does not count an UNCLOSED <think> block as a review either', () => {
+    expect(review('<think>Let me look at the diff. The change adds a tooltip and')).toContain('rc=1');
+  });
+
+  it('still accepts the review that follows a closed <think> block', () => {
+    const out = review(
+      '<think>{"not": "the review"} weighing it up</think>{"summary": "Adds a tooltip.", "fixes": []}',
+    );
+    expect(out).toContain('rc=0');
+  });
+
   it('records the usage it was actually given, not a default', () => {
     // Guards the telemetry itself: numbers that never change are numbers nobody
     // can use to spot a rubber-stamp.

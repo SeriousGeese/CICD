@@ -39,6 +39,45 @@ inputs:
       DnD reviewer so one repository variable budgets both.
     required: false
     default: ''
+  cross-provider-tier:
+    description: >-
+      'true' turns on the ADVISORY cross-provider tier, which runs between the
+      paid OpenRouter tier and the OpenRouter free fallback so that one provider
+      stall no longer takes out the whole chain. Each review draws ONE of two
+      arms at random — the self-hosted sasquatch endpoint or GitHub Models — and
+      degrades to the other if the drawn arm fails (an unprovisioned 403, an
+      unreachable host); only when both fail does the chain move on. The tier is
+      never on the paid list, so a review it produces may comment, and a clean
+      one still merges, but a fix it proposes is never auto-applied. Anything
+      but 'true' — including the empty default — leaves the chain exactly as
+      it was.
+    required: false
+    default: ''
+  sasquatch-endpoint:
+    description: >-
+      OpenAI-compatible chat/completions URL for the cross-provider tier's
+      self-hosted arm. Needs no credential. Empty keeps the engine default.
+      Point it at a NON-thinking model's server; a reasoning preamble is
+      stripped by the parser but costs the whole output budget.
+    required: false
+    default: ''
+  sasquatch-model:
+    description: 'Model id for the sasquatch arm. Empty keeps the engine default.'
+    required: false
+    default: ''
+  github-models-token:
+    description: >-
+      Token for the cross-provider tier's GitHub Models arm — normally the
+      workflow's own GITHUB_TOKEN, which needs the `models: read` permission.
+      EMPTY LEAVES THE ARM OUT OF THE DRAW, which is the safe choice for a repo
+      whose organisation has not enabled GitHub Models: that answers 403, which
+      the engine would degrade past anyway, but only after spending a request.
+    required: false
+    default: ''
+  github-models-model:
+    description: 'Model id for the GitHub Models arm. Empty keeps the engine default.'
+    required: false
+    default: ''
   automerge-authors:
     description: >-
       Comma-separated logins whose PRs get auto-fix pushes and auto-merge.
@@ -113,6 +152,11 @@ runs:
         OPENROUTER_MODEL: ${{ inputs.openrouter-model }}
         OPENROUTER_FALLBACK_MODEL: ${{ inputs.openrouter-fallback-model }}
         PR_REVIEW_LLM_MAX_TIME: ${{ inputs.llm-max-time }}
+        PR_REVIEW_CROSS_PROVIDER: ${{ inputs.cross-provider-tier }}
+        SASQUATCH_ENDPOINT: ${{ inputs.sasquatch-endpoint }}
+        SASQUATCH_MODEL: ${{ inputs.sasquatch-model }}
+        GITHUB_MODELS_TOKEN: ${{ inputs.github-models-token }}
+        GITHUB_MODELS_MODEL: ${{ inputs.github-models-model }}
         AUTOMERGE_AUTHORS: ${{ inputs.automerge-authors }}
         CICD_STRICT_SKIPPED: ${{ inputs.strict-skipped }}
         CICD_DRY_RUN: ${{ inputs.dry-run }}
