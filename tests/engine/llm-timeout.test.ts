@@ -132,6 +132,19 @@ describe('the request cap', () => {
     callLlm({ STUB_CURL_RC: '28', PR_REVIEW_LLM_MAX_TIME: '321' });
     expect(readFileSync(argsFile, 'utf8')).toContain('--max-time 321');
   });
+
+  it('treats an EMPTY value as unset and keeps the engine default', () => {
+    // actions/pr-review forwards inputs.llm-max-time, whose default is '' — and
+    // a caller wiring an undefined repository variable passes '' too. That must
+    // mean "engine default", never `--max-time ''` (curl would reject it and
+    // every tier would fail as if the provider were down).
+    callLlm({ STUB_CURL_RC: '28' });
+    const unset = /--max-time (\d+)/.exec(readFileSync(argsFile, 'utf8'))?.[1];
+    callLlm({ STUB_CURL_RC: '28', PR_REVIEW_LLM_MAX_TIME: '' });
+    const empty = /--max-time (\S+)/.exec(readFileSync(argsFile, 'utf8'))?.[1];
+    expect(unset).toBe('180');
+    expect(empty).toBe(unset);
+  });
 });
 
 describe('the request payload', () => {

@@ -26,6 +26,19 @@ inputs:
     default: ''
   openrouter-model:          { description: 'Primary model id',   required: false, default: '' }
   openrouter-fallback-model: { description: 'Fallback model id',  required: false, default: '' }
+  llm-max-time:
+    description: >-
+      Per-request LLM budget in seconds, passed to the engine as
+      PR_REVIEW_LLM_MAX_TIME and applied as curl --max-time on every tier. Empty
+      (the default) keeps the engine's own default — call_llm reads the name
+      with a colon-dash fallback, which treats an empty value exactly like an
+      unset one — so a caller forwarding an UNDEFINED repository variable gets
+      the engine default rather than a zero cap. It is an input rather than a
+      config.env key because the config loader honours only CICD_* names, and
+      this one is the engine's historical name, shared with the incumbent
+      DnD reviewer so one repository variable budgets both.
+    required: false
+    default: ''
   automerge-authors:
     description: >-
       Comma-separated logins whose PRs get auto-fix pushes and auto-merge.
@@ -99,6 +112,7 @@ runs:
         OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
         OPENROUTER_MODEL: ${{ inputs.openrouter-model }}
         OPENROUTER_FALLBACK_MODEL: ${{ inputs.openrouter-fallback-model }}
+        PR_REVIEW_LLM_MAX_TIME: ${{ inputs.llm-max-time }}
         AUTOMERGE_AUTHORS: ${{ inputs.automerge-authors }}
         CICD_STRICT_SKIPPED: ${{ inputs.strict-skipped }}
         CICD_DRY_RUN: ${{ inputs.dry-run }}

@@ -93,6 +93,12 @@ always falls back.
 a default, so a caller-passed value always wins — which is what keeps a shadow
 run impossible to talk out of dry-run from the branch it is reviewing.
 
+The per-request LLM budget is not settable here either, for the plainer reason
+that its name, `PR_REVIEW_LLM_MAX_TIME`, is not a `CICD_*` name. Pass it as the
+action's `llm-max-time` input instead (seconds, applied as `curl --max-time` to
+every tier). Empty keeps the engine default of 180s, so forwarding a repository
+variable that is not defined is safe.
+
 ### `CICD_STRICT_SKIPPED` — read this before adopting
 
 `ci-status.jq` treats a `skipped` check as a **pass** unless its name is a

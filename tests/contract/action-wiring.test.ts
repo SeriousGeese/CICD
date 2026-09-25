@@ -138,6 +138,22 @@ describe('composite actions', () => {
     }
   });
 
+  it('pr-review forwards llm-max-time to the name the engine reads, defaulting to empty', () => {
+    // The shadow engine could not be re-budgeted before this input existed: no
+    // input mapped to PR_REVIEW_LLM_MAX_TIME, and config.env only carries CICD_*
+    // names (DnD-tc2sq). The default must stay EMPTY so an unwired caller keeps
+    // the engine's own default rather than a literal the action invented.
+    const yml = readFileSync(path.join(actionsDir, 'pr-review', 'action.yml'), 'utf8');
+    const block = yml.slice(yml.indexOf('  llm-max-time:'));
+    expect(yml.indexOf('  llm-max-time:')).toBeGreaterThan(-1);
+    expect(block.match(/default:\s*(.*)/)?.[1]?.trim()).toMatch(/^(''|"")$/);
+    expect(yml).toMatch(/^\s+PR_REVIEW_LLM_MAX_TIME: \$\{\{ inputs\.llm-max-time \}\}$/m);
+
+    // ...and that name is the one call_llm actually reads.
+    const engine = readFileSync(path.join(repoRoot, 'engine', 'pr-review.sh'), 'utf8');
+    expect(engine).toMatch(/\$\{PR_REVIEW_LLM_MAX_TIME:-\d+\}/);
+  });
+
   it('ci-gate refuses an empty required-jobs list', () => {
     // A gate that passes unconditionally is worse than no gate: it looks like
     // protection. Pinned here as well as in ci-gate.test.mjs because the action
