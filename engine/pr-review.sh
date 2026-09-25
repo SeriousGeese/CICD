@@ -1578,8 +1578,28 @@ call_llm() {
   # larger diff needs longer.
   local max_time="${PR_REVIEW_LLM_MAX_TIME:-180}"
   local -a curl_args=(-s --connect-timeout 15 --max-time "$max_time" -o "$body_file" -w '%{http_code}')
+
+  # The credential NEVER goes on curl's command line (DnD-g5eiv). A process's
+  # argv is world-readable — /proc/<pid>/cmdline, `ps -ef` — for as long as it
+  # runs, which for an LLM call is up to $max_time seconds, and the runner host
+  # also executes untrusted PR code in its CI jobs. So `-H "Authorization:
+  # Bearer <key>"` handed the key to every other process on the box.
+  #
+  # Instead curl reads the header from STDIN (`-H @-`, curl >= 7.55.0), fed by
+  # a here-string. A here-string is a bash redirection, not a command: it is
+  # never an execve argument, xtrace does not print it (it shows words, not
+  # redirections — which is also why the header is expanded right there rather
+  # than assigned to a variable first, since an assignment IS traced), and bash
+  # backs it with a pipe or a 0600 temp file it unlinks itself, so there is no
+  # file of ours to leak or clean up on a kill. The key has already been
+  # through sanitize_secret, so it cannot carry a line break that would split
+  # it into a second header line. With no key, `-H @-` is not passed and curl
+  # never reads the (empty) here-string.
+  #
+  # Do not "simplify" this back to an inline -H, and do not move the key into
+  # --config/-K on the command line either — the argv is the whole problem.
   if [ -n "$api_key" ]; then
-    curl_args+=(-H "Authorization: Bearer ${api_key}")
+    curl_args+=(-H @-)
   fi
 
   local curl_started="$SECONDS" curl_rc=0
@@ -1587,7 +1607,7 @@ call_llm() {
   # a negated `if`, `$?` is the status of the negation (always 0), so the real
   # curl exit code — the whole point of telling a timeout apart from an empty
   # response — is lost.
-  http_code="$(curl "${curl_args[@]}" "$endpoint" -H "Content-Type: application/json" -d "@${payload_file}")" || curl_rc=$?
+  http_code="$(curl "${curl_args[@]}" "$endpoint" -H "Content-Type: application/json" -d "@${payload_file}" <<<"${api_key:+Authorization: Bearer ${api_key}}")" || curl_rc=$?
   local elapsed=$((SECONDS - curl_started))
   rm -f "$payload_file"
 
