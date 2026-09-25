@@ -349,6 +349,57 @@ describe('the tier is ADVISORY — it can never auto-apply a fix', () => {
   );
 });
 
+describe('the arm record is per REVIEW, not per run', () => {
+  it('clears llm_arm_drawn when a later converge iteration is served by another tier', () => {
+    // main()'s converge loop calls review_llm up to MAX_ITERATIONS times. Only
+    // the cross-provider tier sets LLM_ARM_DRAWN, so a stale value from
+    // iteration 1 reached the comment beside iteration 2's `openrouter` tier —
+    // a pairing that never happened, attributed into DnD-ne83x's sample.
+    const r = review(
+      { PR_REVIEW_CROSS_PROVIDER_ARM: 'sasquatch' },
+      [
+        // Iteration 2: the paid tier has recovered. STUB_HTTP_* is read by the
+        // curl stub at call time, so flipping the shell variable is enough.
+        'STUB_HTTP_OPENROUTER=200',
+        'rc2=0',
+        'review_llm "system prompt" "user content" || rc2=$?',
+        'echo "RC2=$rc2"',
+        'echo "DRAWN2=$LLM_ARM_DRAWN"',
+        'echo "SERVED2=$LLM_USED_TIER"',
+      ].join('\n'),
+    );
+    // Iteration 1 was served by the arm...
+    expect(r.served).toBe('cross-provider:sasquatch');
+    expect(r.drawn).toBe('sasquatch');
+    // ...iteration 2 by openrouter, and it must not inherit the arm.
+    expect(r.out).toMatch(/^RC2=0$/m);
+    expect(r.out).toMatch(/^SERVED2=openrouter$/m);
+    expect(r.out).toMatch(/^DRAWN2=none$/m);
+  });
+});
+
+describe('credentials are sanitised before they become a header', () => {
+  it('strips stray whitespace from OPENROUTER_API_KEY (pre-existing gap, fixed here)', () => {
+    // The engine sourced sanitize-secret.sh under a comment promising exactly
+    // this, and then used the key raw. curl drops a header containing a line
+    // break, so the request goes out with NO Authorization and reads as a 401.
+    //
+    // A LEADING TAB rather than only a trailing CRLF: MSYS bash on a Windows
+    // runner can shed a trailing CR from an inherited env value on its own, so
+    // a CRLF-only case passed there with the sanitiser removed. A tab survives
+    // every platform, and only sanitize_secret removes it.
+    const r = review({ OPENROUTER_API_KEY: '\tor-key\r\n', STUB_HTTP_OPENROUTER: '200' });
+    expect(r.served).toBe('openrouter');
+    expect(r.requests[0]).toContain('auth=Authorization: Bearer or-key payload=');
+  });
+
+  it('treats a whitespace-only OPENROUTER_API_KEY as unset rather than sending it', () => {
+    const r = review({ OPENROUTER_API_KEY: ' \n', PR_REVIEW_CROSS_PROVIDER: '' });
+    expect(r.out).toContain('skipped — OPENROUTER_API_KEY not set');
+    expect(providers(r)).toEqual([]);
+  });
+});
+
 describe('which arm served is recorded in the comment metadata', () => {
   it('writes llm_tier and llm_arm_drawn into the metadata block', () => {
     const out = h.run({

@@ -119,12 +119,17 @@ BOT_EMAIL="strickdd@gmail.com"
 WORK_DIR="${WORK_DIR}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Strips CR/LF/tab/stray whitespace from OPENROUTER_API_KEY. curl silently drops a
-# header containing a newline, which presents as a 401 from the provider — a real
-# incident in promptci-cloud (#142) that cost a day, and one neither DnD nor
-# PromptCI is protected from today.
+# Strips CR/LF/tab/stray whitespace from every credential the LLM tiers send.
+# curl silently drops a header containing a newline, which presents as a 401 from
+# the provider — a real incident in promptci-cloud (#142) that cost a day.
+#
+# Until DnD-jc8my this comment promised OPENROUTER_API_KEY was sanitised while
+# nothing ever called the function on it: the file was sourced and the key was
+# used raw. Both keys are now actually passed through it, and a test sends a
+# newline-carrying key through the real call_llm to prove the header survives.
 # shellcheck source=./sanitize-secret.sh
 source "${SCRIPT_DIR}/sanitize-secret.sh"
+OPENROUTER_API_KEY="$(sanitize_secret "$OPENROUTER_API_KEY")"
 GITHUB_MODELS_TOKEN="$(sanitize_secret "$GITHUB_MODELS_TOKEN")"
 
 # Provides required_contexts() and ci_status_json() — the two shell-side seams
@@ -1759,6 +1764,14 @@ review_cross_provider() {
 review_llm() {
   local system_prompt="$1" user_content="$2"
   local tier name endpoint model key json_mode
+
+  # Per-review state, reset on EVERY call. main()'s converge loop calls this up
+  # to MAX_ITERATIONS times, and only the cross-provider tier ever sets
+  # LLM_ARM_DRAWN — so without the reset, an iteration served by the arm
+  # followed by one served by openrouter reported `llm_tier: openrouter` beside
+  # `llm_arm_drawn: sasquatch`, a pairing that never happened, straight into
+  # DnD-ne83x's sample.
+  LLM_ARM_DRAWN="none"
 
   # tier format: name|endpoint|model|api_key|json_mode
   # The cross-provider entry is a placeholder: its two arms and their
