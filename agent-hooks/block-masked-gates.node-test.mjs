@@ -32,6 +32,24 @@ function runHook(command, toolName) {
   });
 }
 
+// Pins AGENT_HOOKS_GATE_WRAPPERS for the duration of `fn`, restoring whatever
+// value (including "unset") it carried before — regardless of what a caller's
+// own shell happens to export. `value === undefined` means "no registered
+// wrapper", not "leave it alone": a consumer that exports this var into every
+// agent session's ambient env (through its prefixed copy) must not change what
+// these tests assert about the unregistered-wrapper default.
+function withGateWrappers(value, fn) {
+  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
+  if (value === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
+  else process.env.AGENT_HOOKS_GATE_WRAPPERS = value;
+  try {
+    fn();
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
+    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
+  }
+}
+
 // ── Must BLOCK: real masked gates ───────────────────────────────────────────
 
 // ── Unity and .NET gates ────────────────────────────────────────────────────
@@ -457,15 +475,10 @@ test("option stripping is scoped to the wrapper — a bare leading option is not
 });
 
 test("a consumer can name a differently-spelled wrapper without forking the guard", () => {
-  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
-  try {
-    process.env.AGENT_HOOKS_GATE_WRAPPERS = "run-gate.sh, gate.sh";
+  withGateWrappers("run-gate.sh, gate.sh", () => {
     assert.equal(isMaskedGate("bash tools/run-gate.sh npm test | tail -5"), true);
     assert.equal(isMaskedGate("bash scripts/gate.sh npm test | tail -5"), true);
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
-    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
-  }
+  });
 });
 
 test("the PowerShell branch sees the wrapper too", () => {
@@ -906,7 +919,13 @@ test("a node entrypoint that is NOT a masked gate stays allowed", () => {
 test("isGateStage recognises the node entrypoint at stage start", () => {
   assert.equal(isGateStage("node node_modules/jest/bin/jest.js --ci"), true);
   assert.equal(isGateStage("timeout 900 node node_modules/jest/bin/jest.js"), true);
-  assert.equal(isGateStage("node scripts/run-node-tests.mjs"), false);
+  // Without a registered wrapper, run-node-tests.mjs is not a gate by name —
+  // pin this explicitly: a consumer that exports AGENT_HOOKS_GATE_WRAPPERS
+  // into every agent shell must not flip this assertion depending on who
+  // invokes the test.
+  withGateWrappers(undefined, () => {
+    assert.equal(isGateStage("node scripts/run-node-tests.mjs"), false);
+  });
 });
 
 // ── `node --test`: Node's built-in test runner ──────────────────────────────
@@ -949,15 +968,16 @@ test("`node --test` is blocked on the PowerShell path too", () => {
 });
 
 test("an unrelated node script with no --test-shaped flag stays allowed", () => {
-  const ok = [
-    "node scripts/report.mjs | tail -5",
-    // Without a registered wrapper, run-node-tests.mjs carries no `--test` flag of its own
-    // (the flag lives inside the CHILD process it spawns), so it is not recognised here either.
-    "node scripts/run-node-tests.mjs test:scripts scripts/*.node-test.mjs | tail -5",
-    // "--testing", not "--test": no word boundary right after "--test".
-    "node scripts/foo.mjs --testing-mode | tail -5",
-  ];
-  for (const cmd of ok) assert.equal(isMaskedGate(cmd), false, cmd);
+  assert.equal(isMaskedGate("node scripts/report.mjs | tail -5"), false);
+  // "--testing", not "--test": no word boundary right after "--test".
+  assert.equal(isMaskedGate("node scripts/foo.mjs --testing-mode | tail -5"), false);
+  // Without a registered wrapper, run-node-tests.mjs carries no `--test` flag of its own
+  // (the flag lives inside the CHILD process it spawns), so it is not recognised here
+  // either — pin that explicitly, the same reasoning as the isGateStage test
+  // above: a consumer's ambient AGENT_HOOKS_GATE_WRAPPERS export must not flip this.
+  withGateWrappers(undefined, () => {
+    assert.equal(isMaskedGate("node scripts/run-node-tests.mjs test:scripts scripts/*.node-test.mjs | tail -5"), false);
+  });
 });
 
 test("a `--test`-PREFIXED flag among node's own leading flags is still recognised — the guard over-recognises rather than misses a real one", () => {
@@ -984,9 +1004,7 @@ test("a `--test`-PREFIXED flag among node's own leading flags is still recognise
 // the same wrapper-registration env var the `gate.sh` capture wrapper uses.
 
 test("THE BUG: a registered node-invoked wrapper piped into a filter is now blocked", () => {
-  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
-  try {
-    process.env.AGENT_HOOKS_GATE_WRAPPERS = "gate.sh, run-node-tests.mjs";
+  withGateWrappers("gate.sh, run-node-tests.mjs", () => {
     const bad = [
       "node scripts/run-node-tests.mjs test:scripts scripts/*.node-test.mjs | tail -5",
       "node scripts/run-node-tests.mjs test:hooks scripts/hooks/*.node-test.mjs | grep FAIL",
@@ -997,16 +1015,11 @@ test("THE BUG: a registered node-invoked wrapper piped into a filter is now bloc
       "timeout 900 node scripts/run-node-tests.mjs test:scripts x | tail -5",
     ];
     for (const cmd of bad) assert.equal(isMaskedGate(cmd), true, cmd);
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
-    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
-  }
+  });
 });
 
 test("a registered node-invoked wrapper, bare or with the pipefail hatch, stays allowed", () => {
-  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
-  try {
-    process.env.AGENT_HOOKS_GATE_WRAPPERS = "gate.sh, run-node-tests.mjs";
+  withGateWrappers("gate.sh, run-node-tests.mjs", () => {
     assert.equal(isMaskedGate("node scripts/run-node-tests.mjs test:scripts scripts/*.node-test.mjs"), false);
     assert.equal(
       isMaskedGate("set -o pipefail; node scripts/run-node-tests.mjs test:scripts x | tail -5"),
@@ -1015,38 +1028,25 @@ test("a registered node-invoked wrapper, bare or with the pipefail hatch, stays 
     // The unregistered default name ("gate.sh") is still recognised too — registering one
     // name does not drop the other, since the consumer lists both.
     assert.equal(isMaskedGate("node scripts/gate.sh npm test | tail -5"), true);
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
-    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
-  }
+  });
 });
 
 test("an UNregistered wrapper basename reached via node stays allowed — registration is required", () => {
-  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
-  try {
-    delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
+  withGateWrappers(undefined, () => {
     // The default list is just ["gate.sh"], so run-node-tests.mjs is not
     // recognised until a consumer registers it. This is the existing "isGateStage
     // recognises the node entrypoint at stage start" assertion's sibling, stated
     // for isMaskedGate directly.
     assert.equal(isMaskedGate("node scripts/run-node-tests.mjs test:scripts x | tail -5"), false);
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
-    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
-  }
+  });
 });
 
 test("a registered node-invoked wrapper is blocked on the PowerShell path too", () => {
-  const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
-  try {
-    process.env.AGENT_HOOKS_GATE_WRAPPERS = "gate.sh, run-node-tests.mjs";
+  withGateWrappers("gate.sh, run-node-tests.mjs", () => {
     assert.equal(
       isMaskedGatePowerShell("node scripts/run-node-tests.mjs test:scripts x | Select-Object -Last 20"),
       true,
     );
     assert.equal(isMaskedGatePowerShell("node scripts/run-node-tests.mjs test:scripts x"), false);
-  } finally {
-    if (prev === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
-    else process.env.AGENT_HOOKS_GATE_WRAPPERS = prev;
-  }
+  });
 });
