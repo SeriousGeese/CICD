@@ -35,9 +35,9 @@ function runHook(command, toolName) {
 // Pins AGENT_HOOKS_GATE_WRAPPERS for the duration of `fn`, restoring whatever
 // value (including "unset") it carried before — regardless of what a caller's
 // own shell happens to export. `value === undefined` means "no registered
-// wrapper", not "leave it alone": a consumer (e.g. DnD) that sets this var in
-// every Claude Code session's ambient env must not change what these tests
-// assert about the unregistered-wrapper default (DnD-4z847).
+// wrapper", not "leave it alone": a consumer that exports this var into every
+// agent session's ambient env (through its prefixed copy) must not change what
+// these tests assert about the unregistered-wrapper default.
 function withGateWrappers(value, fn) {
   const prev = process.env.AGENT_HOOKS_GATE_WRAPPERS;
   if (value === undefined) delete process.env.AGENT_HOOKS_GATE_WRAPPERS;
@@ -920,9 +920,9 @@ test("isGateStage recognises the node entrypoint at stage start", () => {
   assert.equal(isGateStage("node node_modules/jest/bin/jest.js --ci"), true);
   assert.equal(isGateStage("timeout 900 node node_modules/jest/bin/jest.js"), true);
   // Without a registered wrapper, run-node-tests.mjs is not a gate by name —
-  // pin this explicitly (DnD-4z847): a consumer that exports
-  // AGENT_HOOKS_GATE_WRAPPERS into every shell (DnD's Claude Code sessions do)
-  // must not flip this assertion depending on who invokes the test.
+  // pin this explicitly: a consumer that exports AGENT_HOOKS_GATE_WRAPPERS
+  // into every agent shell must not flip this assertion depending on who
+  // invokes the test.
   withGateWrappers(undefined, () => {
     assert.equal(isGateStage("node scripts/run-node-tests.mjs"), false);
   });
@@ -973,7 +973,7 @@ test("an unrelated node script with no --test-shaped flag stays allowed", () => 
   assert.equal(isMaskedGate("node scripts/foo.mjs --testing-mode | tail -5"), false);
   // Without a registered wrapper, run-node-tests.mjs carries no `--test` flag of its own
   // (the flag lives inside the CHILD process it spawns), so it is not recognised here
-  // either — pin that explicitly (DnD-4z847), the same reasoning as the isGateStage test
+  // either — pin that explicitly, the same reasoning as the isGateStage test
   // above: a consumer's ambient AGENT_HOOKS_GATE_WRAPPERS export must not flip this.
   withGateWrappers(undefined, () => {
     assert.equal(isMaskedGate("node scripts/run-node-tests.mjs test:scripts scripts/*.node-test.mjs | tail -5"), false);
