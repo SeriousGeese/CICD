@@ -1050,3 +1050,63 @@ test("a registered node-invoked wrapper is blocked on the PowerShell path too", 
     assert.equal(isMaskedGatePowerShell("node scripts/run-node-tests.mjs test:scripts x"), false);
   });
 });
+
+// ── A WRAPPED filter masks exactly like a bare one ──────────────────────────
+// The gate side strips rtk/env/timeout/… before classifying a stage; the filter
+// side used to test the raw stage text, so `rtk proxy tail` read as "some other
+// program" and a masked gate sailed through.
+const JEST_GATE = "node node_modules/jest/bin/jest.js --testPathPatterns foo";
+
+test("blocks a gate piped into a WRAPPED filter (rtk proxy / rtk / env / timeout / command / nice / time)", () => {
+  const bad = [
+    `${JEST_GATE} 2>&1 | rtk proxy tail -n 20`,
+    `${JEST_GATE} | rtk proxy tail`,
+    `${JEST_GATE} | rtk tail`,
+    `${JEST_GATE} | rtk grep FAIL`,
+    `${JEST_GATE} 2>&1 | env LC_ALL=C tail`,
+    `${JEST_GATE} | env -u FOO LC_ALL=C head -5`,
+    `${JEST_GATE} | timeout 5 tail`,
+    `${JEST_GATE} | timeout -s KILL 5 grep -c x`,
+    `${JEST_GATE} | command tail -3`,
+    `${JEST_GATE} | nice -n 5 wc -l`,
+    `${JEST_GATE} | time rg x`,
+    `${JEST_GATE} | FOO=1 tail`,
+    `npm test 2>&1 | rtk proxy tail -n 20`,
+    `rtk proxy npm run lint | rtk proxy head`,
+    // a middle stage that is not a filter does not hide the wrapped filter after it
+    `npm test | cat | rtk proxy tail`,
+  ];
+  for (const cmd of bad) assert.equal(isMaskedGate(cmd), true, cmd);
+});
+
+test("a gate piped into a wrapped filter is refused by the hook process (exit 2)", () => {
+  const r = runHook(`${JEST_GATE} 2>&1 | rtk proxy tail -n 20`);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /Blocked/);
+});
+
+test("a wrapped filter on the PowerShell path is blocked like a bare one; PS cmdlets are unchanged", () => {
+  assert.equal(isMaskedGatePowerShell(`${JEST_GATE} 2>&1 | rtk proxy tail -n 20`), true);
+  assert.equal(isMaskedGatePowerShell(`${JEST_GATE} | env LC_ALL=C head -5`), true);
+  assert.equal(isMaskedGatePowerShell(`${JEST_GATE} | Select-Object -Last 5`), true);
+  assert.equal(isMaskedGatePowerShell(`${JEST_GATE} 2>&1 | rtk proxy tail -n 20; "EXIT:$LASTEXITCODE"`), false);
+  assert.equal(isMaskedGatePowerShell(`${JEST_GATE} | rtk proxy cat`), false);
+});
+
+test("still ALLOWS: pipefail hatch, bare gate, and non-gate pipelines through a wrapped filter", () => {
+  const ok = [
+    `set -o pipefail; ${JEST_GATE} | rtk proxy tail -n 20`,
+    `set -o pipefail; npm test 2>&1 | rtk tail`,
+    JEST_GATE,
+    `${JEST_GATE} > /dev/null 2>&1; echo EXIT:$?`,
+    // not a gate: the wrapped filter is downstream of ordinary work
+    `rtk proxy git log | rtk proxy head`,
+    `rtk proxy git log --oneline | rtk proxy tail -n 5`,
+    `git log | env LC_ALL=C head`,
+    // a wrapped NON-filter downstream of a gate masks nothing the guard knows about
+    `${JEST_GATE} | rtk proxy cat`,
+    // the gate output is already consumed at the `;`, the filter is on a different pipeline
+    `npm test > log.txt; rtk proxy grep foo log.txt | rtk proxy tail`,
+  ];
+  for (const cmd of ok) assert.equal(isMaskedGate(cmd), false, cmd);
+});
