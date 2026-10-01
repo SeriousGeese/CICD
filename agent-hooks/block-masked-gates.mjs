@@ -454,6 +454,23 @@ export function isGateStage(stage) {
   return nodeWrapperGatePrefix().test(command);
 }
 
+/**
+ * True when this pipeline stage, once its wrappers are stripped, IS a Unix filter
+ * (tail/head/grep/rg/wc).
+ *
+ * The filter side needs exactly the normalisation the gate side gets: a gate piped
+ * into `rtk proxy tail -n 20` is every bit as masked as one piped into bare `tail`,
+ * because the pipeline still reports the FILTER's exit and there is no pipefail.
+ * Testing the raw stage text against FILTER_STAGE read `rtk proxy tail` as "some other
+ * program" and let `jest … 2>&1 | rtk proxy tail -n 20` through while `| tail` was
+ * refused. Same wrapper set as the gate side (`rtk [proxy]`, `env X=1`, `timeout N`,
+ * `command`, `nice`, `time`, `sudo`, `nohup`, `exec`, VAR=val), so the two sides can
+ * not drift apart again.
+ */
+export function isFilterStage(stage) {
+  return FILTER_STAGE.test(stripLeadingWrappers(stage));
+}
+
 const HELP_FLAG = /(?:^|\s)(?:--help|-h|-\?|\/\?)(?=\s|$)/;
 
 /**
@@ -485,7 +502,7 @@ export function isMaskedGate(rawCmd) {
     const stages = segment.split("|");
     for (let i = 0; i < stages.length; i++) {
       if (!isGateStage(stages[i])) continue;
-      if (stages.slice(i + 1).some((s) => FILTER_STAGE.test(s))) return true;
+      if (stages.slice(i + 1).some((s) => isFilterStage(s))) return true;
     }
   }
   return false;
@@ -686,7 +703,15 @@ export function isMaskedGatePowerShell(rawCmd) {
       const stages = segment.split("|");
       for (let i = 0; i < stages.length; i++) {
         if (!isGateStage(stages[i].replace(/^\s*&\s+/, ""))) continue;
-        if (stages.slice(i + 1).some((s) => PS_FILTER_STAGE.test(s) || FILTER_STAGE.test(s))) return true;
+        // PS cmdlets are matched on the raw stage (`rtk` wraps external executables,
+        // never cmdlets, so `rtk proxy Select-Object` is not a meaningful shape); the
+        // Unix filters Git-Bash puts on PATH get the same wrapper normalisation as Bash.
+        if (
+          stages
+            .slice(i + 1)
+            .some((s) => PS_FILTER_STAGE.test(s) || isFilterStage(s.replace(/^\s*&\s+/, "")))
+        )
+          return true;
       }
     }
   }
