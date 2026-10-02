@@ -486,6 +486,144 @@ function legacyScan(cmd) {
   return false;
 }
 
+// ── Grouping constructs: `( … )` subshells and `{ …; }` brace groups ────────
+//
+// A pipeline stage that starts with `(` or `{` is not a command word, so splitting
+// the command on `;`/`&&`/`||`/`|` and reading each stage's first word never saw
+// the gate INSIDE the group: `(bash scripts/gate.sh npm run type-check; echo done)
+// 2>&1 | tail -5`, `(npm run type-check) | tail -5` and `{ npm run lint; } | tail -5`
+// were all allowed, while the same gate with no group was refused. Worse, the naive
+// split cut the group at its inner `;`, so the gate and the filter never even landed
+// in the same segment. The group's exit status is that of its LAST statement, so a
+// trailing `; echo done` inside it masks the gate's exit even before the pipe does.
+//
+// So the executable text is parsed into a small structure — statements made of
+// `|`-joined stages, where a stage is either plain text or a group holding its own
+// statements — and a group stage counts as a gate when ANY statement inside it
+// (recursively) is one. It deliberately over-recognises, the same way the rest of
+// this guard does: a group that contains a gate and feeds a filter is refused, and
+// `set -o pipefail;` is the documented hatch. A group that contains no gate
+// (`(cd x && ls) | tail`) is untouched, and so is a bare group with no pipe.
+//
+// Scope notes: `$( … )` / `<( … )` / `x=( … )` inside plain text are skipped as
+// balanced text (their pipes are not the outer pipeline's), not scanned. `if`/`for`/
+// `while` compound commands are not parsed. A newline is a statement separator,
+// except directly after a `|` (a trailing pipe continues onto the next line).
+
+// A standalone `}` is a closer only at a token boundary, so `${HOME}` never closes a group.
+function isGroupCloser(s, i, closer) {
+  if (closer === ")") return s[i] === ")";
+  if (s[i] !== "}") return false;
+  const before = i === 0 ? " " : s[i - 1];
+  const after = i + 1 >= s.length ? " " : s[i + 1];
+  return /[\s;&|()]/.test(before) && /[\s;&|()]/.test(after);
+}
+
+/**
+ * Parse shell text into `{ pipelines, end }`. A pipeline is an array of stages; a
+ * stage is `{ text }` (plain command text) or `{ group }` (the pipelines of a
+ * `( … )` / `{ …; }` body). `closer` is the group closer to stop at, or null at top level.
+ */
+function parseShell(s, start, closer) {
+  const pipelines = [];
+  let stages = [];
+  let i = start;
+  const flush = () => {
+    if (stages.length) pipelines.push(stages);
+    stages = [];
+  };
+  // Plain text up to the next separator, pipe or (at depth 0) group closer. `(` / `)`
+  // mid-text are tracked so `$(a | b; c)` is one balanced run, not outer separators.
+  const readPlain = (from) => {
+    let depth = 0;
+    let j = from;
+    while (j < s.length) {
+      const c = s[j];
+      if (depth === 0) {
+        if (c === ";" || c === "\n" || c === "|") break;
+        if (c === "&" && s[j + 1] === "&") break;
+        if (closer && isGroupCloser(s, j, closer)) break;
+      }
+      if (c === "(") depth++;
+      else if (c === ")" && depth > 0) depth--;
+      j++;
+    }
+    return j;
+  };
+
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === " " || ch === "\t" || ch === "\r") {
+      i++;
+      continue;
+    }
+    if (closer && isGroupCloser(s, i, closer)) {
+      flush();
+      return { pipelines, end: i + 1 };
+    }
+    if (ch === ";" || ch === "\n") {
+      flush();
+      i++;
+      continue;
+    }
+    if (ch === "&" && s[i + 1] === "&") {
+      flush();
+      i += 2;
+      continue;
+    }
+    if (ch === "|") {
+      if (s[i + 1] === "|") {
+        flush();
+        i += 2;
+        continue;
+      }
+      i++;
+      if (s[i] === "&") i++; // `|&` pipes stderr too — still a pipe
+      while (i < s.length && /\s/.test(s[i])) i++; // a trailing `|` continues over the newline
+      continue;
+    }
+    if (ch === "(" || (ch === "{" && /\s/.test(s[i + 1] ?? ""))) {
+      const inner = parseShell(s, i + 1, ch === "(" ? ")" : "}");
+      stages.push({ group: inner.pipelines });
+      i = readPlain(inner.end); // trailing redirects: `) 2>&1`
+      continue;
+    }
+    const end = readPlain(i);
+    stages.push({ text: s.slice(i, end) });
+    i = end;
+  }
+  flush();
+  return { pipelines, end: i };
+}
+
+function stageIsGate(stage) {
+  return stage.group ? groupHasGate(stage.group) : isGateStage(stage.text);
+}
+
+function stageIsFilter(stage) {
+  return stage.group ? groupHasFilter(stage.group) : isFilterStage(stage.text);
+}
+
+function groupHasGate(pipelines) {
+  return pipelines.some((stages) => stages.some(stageIsGate));
+}
+
+function groupHasFilter(pipelines) {
+  return pipelines.some((stages) => stages.some(stageIsFilter));
+}
+
+/** True when some pipeline (at any group depth) has a gate stage with a filter stage after it. */
+function pipelinesMaskGate(pipelines) {
+  for (const stages of pipelines) {
+    for (let i = 0; i < stages.length; i++) {
+      // A group's own body is a pipeline scope too: `(npm test | tail)` masks inside.
+      if (stages[i].group && pipelinesMaskGate(stages[i].group)) return true;
+      if (stageIsGate(stages[i]) && stages.slice(i + 1).some(stageIsFilter)) return true;
+    }
+  }
+  return false;
+}
+
 /** True when a gate's exit code would be masked by a filter later in its own pipeline. */
 export function isMaskedGate(rawCmd) {
   // Explicit escape hatches: the author is already handling pipeline exits.
@@ -497,15 +635,9 @@ export function isMaskedGate(rawCmd) {
 
   // Only a filter DOWNSTREAM of a gate in the SAME pipeline masks its exit code —
   // `npm test > log; grep foo log | tail` is fine (the gate's exit was already
-  // observable at the `;`). Split into ;/&&/|| segments, then each into `|` stages.
-  for (const segment of cmd.split(/;|&&|\|\|/)) {
-    const stages = segment.split("|");
-    for (let i = 0; i < stages.length; i++) {
-      if (!isGateStage(stages[i])) continue;
-      if (stages.slice(i + 1).some((s) => isFilterStage(s))) return true;
-    }
-  }
-  return false;
+  // observable at the `;`). Statements split on ;/&&/||/newline, each into `|`
+  // stages, and a `( … )` / `{ …; }` stage is searched for a gate (see above).
+  return pipelinesMaskGate(parseShell(cmd, 0, null).pipelines);
 }
 
 // ── PowerShell ──────────────────────────────────────────────────────────────

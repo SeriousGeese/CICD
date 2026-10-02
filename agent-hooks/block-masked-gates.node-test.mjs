@@ -1110,3 +1110,109 @@ test("still ALLOWS: pipefail hatch, bare gate, and non-gate pipelines through a 
   ];
   for (const cmd of ok) assert.equal(isMaskedGate(cmd), false, cmd);
 });
+
+// ── Subshell `( … )` and brace group `{ …; }` stages ─────────────
+//
+// A stage starting with `(` or `{` has no command word, so the gate inside a group
+// was never seen — and the naive `;` split cut the group in half besides.
+
+test("THE BUG: a gate inside a subshell or brace group piped into a filter is blocked", () => {
+  const bad = [
+    // the unwrapped baseline from the bead: already blocked before the fix
+    "bash scripts/gate.sh --name tsc npm run type-check | tail -5",
+    // the three shapes the bead reproduced as ALLOWED
+    "(bash scripts/gate.sh --name tsc npm run type-check; echo done) 2>&1 | tail -5",
+    "(npm run type-check) | tail -5",
+    "{ npm run lint; } | tail -5",
+  ];
+  for (const cmd of bad) assert.equal(isMaskedGate(cmd), true, cmd);
+});
+
+test("a group is a gate when ANY statement inside it is, wherever it sits", () => {
+  const bad = [
+    "(cd web && npm run lint) 2>&1 | tail",
+    "(echo start; npm test) | head -5",
+    "{ cd web; npm run lint; } | tail -5",
+    "{ npm run lint; echo done; } 2>&1 | tail -5",
+    // nested groups
+    "((npm test)) | tail",
+    "( { npm test; } ) | grep -c ok",
+    // a gate group in the middle of a pipeline, filter after it
+    "echo x | (npm test) | tail",
+    // wrappers inside the group are stripped like anywhere else
+    "(timeout 900 npm run lint) | tail -4",
+    "(rtk proxy npm test) | rtk proxy tail",
+    // command substitution inside the group does not close it early
+    "(echo $(date); npm test) | tail",
+    // the pipe INSIDE the group masks, with no outer pipe at all
+    "(npm test | tail)",
+    "{ npm test 2>&1 | tail -3; }",
+    // a multi-line group body
+    "(\n  npm run lint\n  echo done\n) | tail",
+    // a group on the FILTER side is still a filter
+    "npm test | (cat; tail -2)",
+    "npm test | { head -5; }",
+  ];
+  for (const cmd of bad) assert.equal(isMaskedGate(cmd), true, cmd);
+});
+
+test("groups that are NOT masked gates stay allowed", () => {
+  const ok = [
+    // no gate inside the group
+    "(cd x && ls) | tail",
+    "{ echo a; echo b; } | tail",
+    "(git log --oneline) | head -5",
+    // a bare group, no pipe: the guard is about pipes
+    "(npm run lint)",
+    "{ npm run lint; }",
+    "(npm run lint; echo done)",
+    // the documented hatch still works around a group
+    "set -o pipefail; (npm run lint) | tail -5",
+    "set -o pipefail; { npm run lint; } 2>&1 | head",
+    // the gate's exit is observable at the `;`/`&&`, the filter is on another pipeline
+    "(npm test) > log.txt 2>&1; (grep foo log.txt) | tail",
+    "(npm test) && (git log | tail -3)",
+    // a gate group followed by a non-filter
+    "(npm test) | cat",
+    // a gate NAME that is only data inside a group
+    "(echo 'npm test') | tail",
+    // `${…}` is not a brace group
+    "echo ${HOME} | tail",
+    // a help lookup inside a group prints usage and runs nothing
+    "(npm run lint --help) | head",
+  ];
+  for (const cmd of ok) assert.equal(isMaskedGate(cmd), false, cmd);
+});
+
+test("`|&`, a trailing `|` over a newline, and a gate on a later line are still pipes and statements", () => {
+  assert.equal(isMaskedGate("npm test |& tail -3"), true);
+  assert.equal(isMaskedGate("npm test |\n  tail -3"), true);
+  assert.equal(isMaskedGate("echo hi\nnpm test | tail"), true);
+  // …and a newline-separated filter on its own line is a different statement
+  assert.equal(isMaskedGate("npm test > log.txt 2>&1\ngrep foo log.txt | tail"), false);
+});
+
+test("a pipe inside `$( … )` belongs to the substitution, not the outer pipeline", () => {
+  assert.equal(isMaskedGate("npm test $(echo a | tail -1)"), false);
+  assert.equal(isMaskedGate("(echo $(a | b); npm test) | tail"), true);
+});
+
+test("a gate group piped into a filter is refused by the hook process (exit 2)", () => {
+  for (const cmd of [
+    "(bash scripts/gate.sh --name tsc npm run type-check; echo done) 2>&1 | tail -5",
+    "(npm run type-check) | tail -5",
+    "{ npm run lint; } | tail -5",
+  ]) {
+    const r = runHook(cmd);
+    assert.equal(r.status, 2, cmd);
+    assert.match(r.stderr, /Blocked/, cmd);
+  }
+  assert.equal(runHook("(cd x && ls) | tail").status, 0);
+  assert.equal(runHook("(npm run lint)").status, 0);
+  assert.equal(runHook("set -o pipefail; (npm run lint) | tail -5").status, 0);
+});
+
+test("the PowerShell branch is unchanged by group parsing", () => {
+  assert.equal(isMaskedGatePowerShell("npm test | Select-Object -Last 5"), true);
+  assert.equal(isMaskedGatePowerShell("npm test > $null 2>&1; \"EXIT:$LASTEXITCODE\""), false);
+});
