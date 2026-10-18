@@ -796,6 +796,17 @@ function psChunks(cmd) {
 
 /** Nested-shell fallback, mirroring legacyScan: gate anywhere + filter in the same statement. */
 function legacyScanPs(cmd) {
+  // A PowerShell command may route execution into Bash with `bash -c`. The
+  // PowerShell caller still needs PowerShell's filter rules below, but the
+  // nested script must use Bash's broader pipeline and pipefail semantics.
+  // Inspect only the actual `-c` argument so a quoted regex alternation in a
+  // gate's arguments is not mistaken for an executable pipeline.
+  const bashScript = /\b(?:ba|z|da|k)?sh\b(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c\s+(?:'([^']*)'|"((?:\\.|[^"\\])*)")/i;
+  for (const m of cmd.matchAll(new RegExp(bashScript.source, "gi"))) {
+    const script = m[1] ?? m[2].replace(/\\([\\"$`])/g, "$1");
+    if (isMaskedGate(script)) return true;
+  }
+
   for (const m of cmd.matchAll(new RegExp(GATE.source, "g"))) {
     const segment = cmd.slice(m.index).split(/;|&&|\|\||\n/)[0];
     if (MASK.test(segment) || PS_MASK.test(segment)) return true;

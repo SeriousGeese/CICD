@@ -818,6 +818,20 @@ test("STILL blocks a masked gate handed to a nested shell as a string", () => {
   }
 });
 
+test("PowerShell-routed nested Bash uses Bash pipeline and pipefail semantics", () => {
+  const masked = runHook('bash -c "npm test | cat"', "PowerShell");
+  assert.equal(masked.status, 2);
+  assert.match(masked.stderr, /PowerShell filter masks its exit code/);
+
+  // The pipe character is part of the runner's regex argument, not a Bash
+  // pipeline, even though this command is routed through the PowerShell hook.
+  assert.equal(runHook('bash -c "npm test --testNamePattern \'foo|bar\'"', "PowerShell").status, 0);
+
+  // pipefail preserves the nested Bash pipeline's gate status, just as it does
+  // when the Bash hook receives the same command directly.
+  assert.equal(runHook('bash -c "set -o pipefail; npm test | cat"', "PowerShell").status, 0);
+});
+
 test("stripPowerShellQuoted blanks quoted runs, here-strings and backtick escapes", () => {
   assert.match(stripPowerShellQuoted(`bd note X "npm test | Select-Object" -q`), /^bd note X\s+-q$/);
   assert.match(stripPowerShellQuoted(`echo 'a | b' done`), /^echo\s+done$/);
