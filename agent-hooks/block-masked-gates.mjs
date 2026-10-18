@@ -482,7 +482,36 @@ const HELP_FLAG = /(?:^|\s)(?:--help|-h|-\?|\/\?)(?=\s|$)/;
  * the same ;/&&/|| segment. Kept only for nested shells, where the quoted text is
  * itself executed and cannot be split into stages from out here.
  */
+const BASH_COMMAND_ARGUMENT = /\b(?:ba|z|da|k)?sh\b(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c\s+(?:'([^']*)'|"((?:\\.|[^"\\])*)")/gi;
+
+function nestedBashScript(match) {
+  return match[1] ?? match[2].replace(/\\([\\"$`])/g, "$1");
+}
+
 function legacyScan(cmd) {
+  // A `bash -c` argument is executable Bash source, not one flat command
+  // string. Parse that source on its own so quoted argument alternations such
+  // as `--testNamePattern 'foo|bar'` do not become pipeline separators here.
+  let hasNestedCommand = false;
+  let nestedMasksGate = false;
+  const outer = cmd.replace(new RegExp(BASH_COMMAND_ARGUMENT.source, "gi"), (...args) => {
+    hasNestedCommand = true;
+    const match = args.slice(0, 3);
+    const script = nestedBashScript(match);
+    if (isMaskedGate(script)) {
+      nestedMasksGate = true;
+      return "bash -c 'npm test'";
+    }
+
+    // Preserve detection when a bare nested gate's own Bash process is piped
+    // downstream, while avoiding gate-like text inside quoted arguments.
+    const pipelines = parseShell(script, 0, null).pipelines;
+    return groupHasGate(pipelines) ? "bash -c 'npm test'" : "bash -c 'echo'";
+  });
+
+  if (hasNestedCommand) cmd = outer;
+  if (nestedMasksGate) return true;
+
   for (const m of cmd.matchAll(new RegExp(GATE.source, "g"))) {
     const segment = cmd.slice(m.index).split(/;|&&|\|\|/)[0];
     if (BASH_PIPE.test(segment)) return true;

@@ -224,6 +224,18 @@ test("STILL blocks a masked gate inside a nested shell — stripping must not cr
   }
 });
 
+test("nested Bash command strings are parsed as executable scripts, not flat wrapper text", () => {
+  assert.equal(isMaskedGate(`bash -c "npm test --testNamePattern 'foo|bar'"`), false);
+  assert.equal(isMaskedGate(`bash -c "npm test | cat"`), true);
+  assert.equal(isMaskedGate(`bash -c "set -o pipefail; npm test | cat"`), false);
+});
+
+test("nested Bash stdin and heredoc commands keep their gate checks", () => {
+  assert.equal(isMaskedGate(`echo 'npm test | cat' | bash`), true);
+  const heredoc = ["bash <<'EOF'", "npm test | cat", "EOF"].join("\n");
+  assert.equal(isMaskedGate(heredoc), true);
+});
+
 test("blocks the second of two gates when only that one is masked", () => {
   assert.equal(isMaskedGate("npm run lint; npm test | tail -3"), true);
 });
