@@ -236,6 +236,27 @@ test("nested Bash stdin and heredoc commands keep their gate checks", () => {
   assert.equal(isMaskedGate(heredoc), true);
 });
 
+test("quoted regex alternations stay data in Bash heredocs and stdin scripts", () => {
+  const heredoc = [
+    "bash <<'EOF'",
+    "npm test --testNamePattern 'foo|bar'",
+    "EOF",
+  ].join("\n");
+  assert.equal(isMaskedGate(heredoc), false);
+
+  assert.equal(isMaskedGate(`echo "npm test --testNamePattern 'foo|bar'" | bash`), false);
+
+  // Without quotes preserved in the emitted script, `foo|bar` is an actual
+  // shell pipeline and must not be treated as regex data.
+  assert.equal(isMaskedGate(`echo 'npm test --testNamePattern foo|bar' | bash`), true);
+});
+
+test("real masked gates stay blocked in Bash heredoc and stdin scripts", () => {
+  const heredoc = ["bash <<'EOF'", "npm test | cat", "EOF"].join("\n");
+  assert.equal(isMaskedGate(heredoc), true);
+  assert.equal(isMaskedGate(`echo "npm test | cat" | bash`), true);
+});
+
 test("blocks the second of two gates when only that one is masked", () => {
   assert.equal(isMaskedGate("npm run lint; npm test | tail -3"), true);
 });

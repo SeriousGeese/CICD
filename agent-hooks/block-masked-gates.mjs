@@ -488,14 +488,17 @@ function nestedBashScript(match) {
   return match[1] ?? match[2].replace(/\\([\\"$`])/g, "$1");
 }
 
+function nestedBashPlaceholder(script) {
+  const pipelines = parseShell(script, 0, null).pipelines;
+  return groupHasGate(pipelines) ? "bash -c 'npm test'" : "bash -c 'echo'";
+}
+
 function legacyScan(cmd) {
   // A `bash -c` argument is executable Bash source, not one flat command
   // string. Parse that source on its own so quoted argument alternations such
   // as `--testNamePattern 'foo|bar'` do not become pipeline separators here.
-  let hasNestedCommand = false;
   let nestedMasksGate = false;
-  const outer = cmd.replace(new RegExp(BASH_COMMAND_ARGUMENT.source, "gi"), (...args) => {
-    hasNestedCommand = true;
+  cmd = cmd.replace(new RegExp(BASH_COMMAND_ARGUMENT.source, "gi"), (...args) => {
     const match = args.slice(0, 3);
     const script = nestedBashScript(match);
     if (isMaskedGate(script)) {
@@ -505,11 +508,24 @@ function legacyScan(cmd) {
 
     // Preserve detection when a bare nested gate's own Bash process is piped
     // downstream, while avoiding gate-like text inside quoted arguments.
-    const pipelines = parseShell(script, 0, null).pipelines;
-    return groupHasGate(pipelines) ? "bash -c 'npm test'" : "bash -c 'echo'";
+    return nestedBashPlaceholder(script);
   });
 
-  if (hasNestedCommand) cmd = outer;
+  // Bash can also receive its script on stdin. Parse heredoc bodies and simple
+  // echo/printf pipelines as Bash source before the legacy whole-string scan.
+  const heredoc = /\b(?:ba|z|da|k)?sh\b[^\n]*<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/gi;
+  cmd = cmd.replace(heredoc, (whole, _quote, _marker, script) => {
+    if (isMaskedGate(script)) nestedMasksGate = true;
+    return whole.replace(script, nestedBashPlaceholder(script));
+  });
+
+  const stdinPipe = /\b(?:echo|printf)\s+(?:"((?:\\.|[^"\\])*)"|'([^']*)')\s*\|\s*(?:ba|z|da|k)?sh\b/gi;
+  cmd = cmd.replace(stdinPipe, (_whole, doubleQuoted, singleQuoted) => {
+    const script = doubleQuoted === undefined ? singleQuoted : doubleQuoted.replace(/\\([\\"$`])/g, "$1");
+    if (isMaskedGate(script)) nestedMasksGate = true;
+    return nestedBashPlaceholder(script);
+  });
+
   if (nestedMasksGate) return true;
 
   for (const m of cmd.matchAll(new RegExp(GATE.source, "g"))) {
