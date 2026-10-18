@@ -126,8 +126,24 @@ test("blocks the canonical masked gates", () => {
     "npx tsc --noEmit | grep TS",
     "yarn test | tail",
     "next build | rg error",
+    // Bash returns the last pipeline stage's status, so every downstream command
+    // can mask the gate, including commands that are not text filters.
+    "npm test | cat",
+    "npm test | tee gate.log",
+    "npm test | sed -n '1,5p'",
+    "npm test | awk '{print}'",
+    "npm test | less",
+    "npm test | more",
   ];
   for (const c of bad) assert.equal(isMaskedGate(c), true, c);
+
+  for (const c of [
+    "cat gate.log | sed -n '1,5p'",
+    "ls node_modules/.bin/jest* | head -1",
+    "set -o pipefail; npm test | cat",
+  ]) {
+    assert.equal(isMaskedGate(c), false, c);
+  }
 });
 
 test("blocks pnpm and vitest gates, the shapes a pnpm monorepo actually runs", () => {
@@ -206,6 +222,39 @@ test("STILL blocks a masked gate inside a nested shell — stripping must not cr
   ]) {
     assert.equal(isMaskedGate(c), true, c);
   }
+});
+
+test("nested Bash command strings are parsed as executable scripts, not flat wrapper text", () => {
+  assert.equal(isMaskedGate(`bash -c "npm test --testNamePattern 'foo|bar'"`), false);
+  assert.equal(isMaskedGate(`bash -c "npm test | cat"`), true);
+  assert.equal(isMaskedGate(`bash -c "set -o pipefail; npm test | cat"`), false);
+});
+
+test("nested Bash stdin and heredoc commands keep their gate checks", () => {
+  assert.equal(isMaskedGate(`echo 'npm test | cat' | bash`), true);
+  const heredoc = ["bash <<'EOF'", "npm test | cat", "EOF"].join("\n");
+  assert.equal(isMaskedGate(heredoc), true);
+});
+
+test("quoted regex alternations stay data in Bash heredocs and stdin scripts", () => {
+  const heredoc = [
+    "bash <<'EOF'",
+    "npm test --testNamePattern 'foo|bar'",
+    "EOF",
+  ].join("\n");
+  assert.equal(isMaskedGate(heredoc), false);
+
+  assert.equal(isMaskedGate(`echo "npm test --testNamePattern 'foo|bar'" | bash`), false);
+
+  // Without quotes preserved in the emitted script, `foo|bar` is an actual
+  // shell pipeline and must not be treated as regex data.
+  assert.equal(isMaskedGate(`echo 'npm test --testNamePattern foo|bar' | bash`), true);
+});
+
+test("real masked gates stay blocked in Bash heredoc and stdin scripts", () => {
+  const heredoc = ["bash <<'EOF'", "npm test | cat", "EOF"].join("\n");
+  assert.equal(isMaskedGate(heredoc), true);
+  assert.equal(isMaskedGate(`echo "npm test | cat" | bash`), true);
 });
 
 test("blocks the second of two gates when only that one is masked", () => {
@@ -298,9 +347,9 @@ test("a gate as a LATER pipeline stage, followed by a filter, still blocks", () 
   assert.equal(isMaskedGate("cat tests.txt | npx jest | tail -3"), true);
 });
 
-test("a gate followed by a NON-filter stage is not masked", () => {
-  assert.equal(isMaskedGate("npm test | cat"), false);
-  assert.equal(isMaskedGate("npm test | tee out.log"), false);
+test("a gate followed by any Bash pipeline stage can have its status masked", () => {
+  assert.equal(isMaskedGate("npm test | cat"), true);
+  assert.equal(isMaskedGate("npm test | tee out.log"), true);
 });
 
 // ── a `timeout` prefix defeated the guard entirely ──────────────
@@ -802,6 +851,20 @@ test("STILL blocks a masked gate handed to a nested shell as a string", () => {
   }
 });
 
+test("PowerShell-routed nested Bash uses Bash pipeline and pipefail semantics", () => {
+  const masked = runHook('bash -c "npm test | cat"', "PowerShell");
+  assert.equal(masked.status, 2);
+  assert.match(masked.stderr, /PowerShell filter masks its exit code/);
+
+  // The pipe character is part of the runner's regex argument, not a Bash
+  // pipeline, even though this command is routed through the PowerShell hook.
+  assert.equal(runHook('bash -c "npm test --testNamePattern \'foo|bar\'"', "PowerShell").status, 0);
+
+  // pipefail preserves the nested Bash pipeline's gate status, just as it does
+  // when the Bash hook receives the same command directly.
+  assert.equal(runHook('bash -c "set -o pipefail; npm test | cat"', "PowerShell").status, 0);
+});
+
 test("stripPowerShellQuoted blanks quoted runs, here-strings and backtick escapes", () => {
   assert.match(stripPowerShellQuoted(`bd note X "npm test | Select-Object" -q`), /^bd note X\s+-q$/);
   assert.match(stripPowerShellQuoted(`echo 'a | b' done`), /^echo\s+done$/);
@@ -825,15 +888,18 @@ test("splitScriptBlocks keeps nested braces with their block", () => {
 
 // ── Tool routing: PowerShell analysis only for the PowerShell tool ───────────
 
-test("the hook blocks a PowerShell-shaped mask ONLY when tool_name says PowerShell", () => {
+test("PowerShell advice is specific to PowerShell, while Bash blocks any downstream command", () => {
   const cmd = "npx jest | Select-Object -Last 5";
   const blocked = runHook(cmd, "PowerShell");
   assert.equal(blocked.status, 2);
   assert.match(blocked.stderr, /PowerShell filter masks its exit code/);
 
-  // The same string under Bash is not a masked gate — `Select-Object` is not a
-  // Unix filter — and must not be blocked with PowerShell advice.
-  assert.equal(runHook(cmd, "Bash").status, 0);
+  // On Bash, the final pipeline stage may mask a failed gate regardless of whether
+  // the command is a familiar text filter or a PowerShell-named executable.
+  const bashBlocked = runHook(cmd, "Bash");
+  assert.equal(bashBlocked.status, 2);
+  assert.match(bashBlocked.stderr, /no pipefail by default/);
+  assert.doesNotMatch(bashBlocked.stderr, /PowerShell filter masks its exit code/);
 });
 
 test("existing Bash behaviour is unchanged, with or without tool_name", () => {
@@ -1103,12 +1169,11 @@ test("still ALLOWS: pipefail hatch, bare gate, and non-gate pipelines through a 
     `rtk proxy git log | rtk proxy head`,
     `rtk proxy git log --oneline | rtk proxy tail -n 5`,
     `git log | env LC_ALL=C head`,
-    // a wrapped NON-filter downstream of a gate masks nothing the guard knows about
-    `${JEST_GATE} | rtk proxy cat`,
     // the gate output is already consumed at the `;`, the filter is on a different pipeline
     `npm test > log.txt; rtk proxy grep foo log.txt | rtk proxy tail`,
   ];
   for (const cmd of ok) assert.equal(isMaskedGate(cmd), false, cmd);
+  assert.equal(isMaskedGate(`${JEST_GATE} | rtk proxy cat`), true);
 });
 
 // ── Subshell `( … )` and brace group `{ …; }` stages ─────────────
@@ -1172,8 +1237,6 @@ test("groups that are NOT masked gates stay allowed", () => {
     // the gate's exit is observable at the `;`/`&&`, the filter is on another pipeline
     "(npm test) > log.txt 2>&1; (grep foo log.txt) | tail",
     "(npm test) && (git log | tail -3)",
-    // a gate group followed by a non-filter
-    "(npm test) | cat",
     // a gate NAME that is only data inside a group
     "(echo 'npm test') | tail",
     // `${…}` is not a brace group
@@ -1182,6 +1245,7 @@ test("groups that are NOT masked gates stay allowed", () => {
     "(npm run lint --help) | head",
   ];
   for (const cmd of ok) assert.equal(isMaskedGate(cmd), false, cmd);
+  assert.equal(isMaskedGate("(npm test) | cat"), true);
 });
 
 test("`|&`, a trailing `|` over a newline, and a gate on a later line are still pipes and statements", () => {

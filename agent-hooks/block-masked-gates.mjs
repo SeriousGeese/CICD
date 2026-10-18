@@ -1,6 +1,6 @@
 // PreToolUse(Bash|PowerShell) hook: reject gate commands (test/lint/build/
-// type-check) whose output is piped into a filter — tail/head/grep/rg/wc under
-// Bash, Select-Object/Select-String/Out-Null/… under PowerShell.
+// type-check) whose output is piped into another command under Bash, or into a
+// PowerShell filter such as Select-Object/Select-String/Out-Null/… .
 //
 // Why: Git Bash (and most interactive shells) do not set pipefail, so
 // `npm test 2>&1 | tail -8` reports the FILTER's exit code — a failing gate
@@ -9,12 +9,12 @@
 //
 // PRECISION: only EXECUTABLE text is scanned. Quoted arguments and heredoc bodies
 // are data, not commands — an issue description that happens to mention
-// `npm run lint`, in a command that also pipes to `tail`, is not a masked gate.
+// `npm run lint`, in a command that also pipes to `cat`, is not a masked gate.
 // That false positive is the common one: `bd create` / `bd note` / `gh` commands
 // whose DESCRIPTION quotes a gate name while the command pipes to `tail`. Heredoc
 // bodies are stripped for the same reason, though the trigger there is narrower
-// than it looks: an ordinary markdown table (`| pass |`) never matched the filter
-// list — it takes prose containing an actual `| wc` / `| tail` to trip it.
+// than it looks: an ordinary markdown table (`| pass |`) has no gate stage in a
+// pipeline — it takes executable gate code piped to another command to trip it.
 //
 // Stripping is SKIPPED when the command hands its quoted text or heredoc to a
 // nested shell, because there the text really does execute — a false negative
@@ -115,7 +115,10 @@ export const GATE = new RegExp(
     PNPM_SELECTORS +
     String.raw`(?:(?:run\s+)?(?:test|lint|build|type-?check)|(?:exec\s+|dlx\s+)?${DIRECT_RUNNERS})|pnpx\s+${DIRECT_RUNNERS}|${NODE_ENTRY}|${NODE_TEST}|${UNITY_CLI}|${UNITY_BATCH}|${DOTNET}|(?:jest|vitest|eslint)(?![-\w])|tsc\s+--noEmit|next\s+build|bd\s+dolt\s+(?:push|pull)|(?:node\s+)?\S*bd-dolt-sync\.mjs\s+(?:push|pull))\b`,
 );
+// PowerShell uses the familiar Unix filters as a narrow cross-platform vocabulary;
+// Bash below uses BASH_PIPE because any downstream command can mask a gate there.
 export const MASK = /\|\s*(?:tail|head|grep|rg|wc)\b/;
+const BASH_PIPE = /\|/;
 
 // A nested shell EXECUTES the text it is handed, so quoted/heredoc content is
 // live code there and must keep being scanned: `bash -c "npm test | tail"`,
@@ -456,7 +459,8 @@ export function isGateStage(stage) {
 
 /**
  * True when this pipeline stage, once its wrappers are stripped, IS a Unix filter
- * (tail/head/grep/rg/wc).
+ * (tail/head/grep/rg/wc). PowerShell uses this vocabulary for Unix filters on PATH;
+ * Bash treats every downstream pipeline stage as masking, regardless of command.
  *
  * The filter side needs exactly the normalisation the gate side gets: a gate piped
  * into `rtk proxy tail -n 20` is every bit as masked as one piped into bare `tail`,
@@ -474,14 +478,59 @@ export function isFilterStage(stage) {
 const HELP_FLAG = /(?:^|\s)(?:--help|-h|-\?|\/\?)(?=\s|$)/;
 
 /**
- * The original, pre-stage-start behaviour: gate token ANYWHERE, filter pipe anywhere in
+ * The original, pre-stage-start behaviour: gate token ANYWHERE, pipe anywhere in
  * the same ;/&&/|| segment. Kept only for nested shells, where the quoted text is
  * itself executed and cannot be split into stages from out here.
  */
+const BASH_COMMAND_ARGUMENT = /\b(?:ba|z|da|k)?sh\b(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c\s+(?:'([^']*)'|"((?:\\.|[^"\\])*)")/gi;
+
+function nestedBashScript(match) {
+  return match[1] ?? match[2].replace(/\\([\\"$`])/g, "$1");
+}
+
+function nestedBashPlaceholder(script) {
+  const pipelines = parseShell(script, 0, null).pipelines;
+  return groupHasGate(pipelines) ? "bash -c 'npm test'" : "bash -c 'echo'";
+}
+
 function legacyScan(cmd) {
+  // A `bash -c` argument is executable Bash source, not one flat command
+  // string. Parse that source on its own so quoted argument alternations such
+  // as `--testNamePattern 'foo|bar'` do not become pipeline separators here.
+  let nestedMasksGate = false;
+  cmd = cmd.replace(new RegExp(BASH_COMMAND_ARGUMENT.source, "gi"), (...args) => {
+    const match = args.slice(0, 3);
+    const script = nestedBashScript(match);
+    if (isMaskedGate(script)) {
+      nestedMasksGate = true;
+      return "bash -c 'npm test'";
+    }
+
+    // Preserve detection when a bare nested gate's own Bash process is piped
+    // downstream, while avoiding gate-like text inside quoted arguments.
+    return nestedBashPlaceholder(script);
+  });
+
+  // Bash can also receive its script on stdin. Parse heredoc bodies and simple
+  // echo/printf pipelines as Bash source before the legacy whole-string scan.
+  const heredoc = /\b(?:ba|z|da|k)?sh\b[^\n]*<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/gi;
+  cmd = cmd.replace(heredoc, (whole, _quote, _marker, script) => {
+    if (isMaskedGate(script)) nestedMasksGate = true;
+    return whole.replace(script, nestedBashPlaceholder(script));
+  });
+
+  const stdinPipe = /\b(?:echo|printf)\s+(?:"((?:\\.|[^"\\])*)"|'([^']*)')\s*\|\s*(?:ba|z|da|k)?sh\b/gi;
+  cmd = cmd.replace(stdinPipe, (_whole, doubleQuoted, singleQuoted) => {
+    const script = doubleQuoted === undefined ? singleQuoted : doubleQuoted.replace(/\\([\\"$`])/g, "$1");
+    if (isMaskedGate(script)) nestedMasksGate = true;
+    return nestedBashPlaceholder(script);
+  });
+
+  if (nestedMasksGate) return true;
+
   for (const m of cmd.matchAll(new RegExp(GATE.source, "g"))) {
     const segment = cmd.slice(m.index).split(/;|&&|\|\|/)[0];
-    if (MASK.test(segment)) return true;
+    if (BASH_PIPE.test(segment)) return true;
   }
   return false;
 }
@@ -600,25 +649,17 @@ function stageIsGate(stage) {
   return stage.group ? groupHasGate(stage.group) : isGateStage(stage.text);
 }
 
-function stageIsFilter(stage) {
-  return stage.group ? groupHasFilter(stage.group) : isFilterStage(stage.text);
-}
-
 function groupHasGate(pipelines) {
   return pipelines.some((stages) => stages.some(stageIsGate));
 }
 
-function groupHasFilter(pipelines) {
-  return pipelines.some((stages) => stages.some(stageIsFilter));
-}
-
-/** True when some pipeline (at any group depth) has a gate stage with a filter stage after it. */
+/** True when some pipeline (at any group depth) has a gate stage followed by another stage. */
 function pipelinesMaskGate(pipelines) {
   for (const stages of pipelines) {
     for (let i = 0; i < stages.length; i++) {
       // A group's own body is a pipeline scope too: `(npm test | tail)` masks inside.
       if (stages[i].group && pipelinesMaskGate(stages[i].group)) return true;
-      if (stageIsGate(stages[i]) && stages.slice(i + 1).some(stageIsFilter)) return true;
+      if (stageIsGate(stages[i]) && i + 1 < stages.length) return true;
     }
   }
   return false;
@@ -800,6 +841,17 @@ function psChunks(cmd) {
 
 /** Nested-shell fallback, mirroring legacyScan: gate anywhere + filter in the same statement. */
 function legacyScanPs(cmd) {
+  // A PowerShell command may route execution into Bash with `bash -c`. The
+  // PowerShell caller still needs PowerShell's filter rules below, but the
+  // nested script must use Bash's broader pipeline and pipefail semantics.
+  // Inspect only the actual `-c` argument so a quoted regex alternation in a
+  // gate's arguments is not mistaken for an executable pipeline.
+  const bashScript = /\b(?:ba|z|da|k)?sh\b(?:\s+-[A-Za-z]+)*\s+-[A-Za-z]*c\s+(?:'([^']*)'|"((?:\\.|[^"\\])*)")/i;
+  for (const m of cmd.matchAll(new RegExp(bashScript.source, "gi"))) {
+    const script = m[1] ?? m[2].replace(/\\([\\"$`])/g, "$1");
+    if (isMaskedGate(script)) return true;
+  }
+
   for (const m of cmd.matchAll(new RegExp(GATE.source, "g"))) {
     const segment = cmd.slice(m.index).split(/;|&&|\|\||\n/)[0];
     if (MASK.test(segment) || PS_MASK.test(segment)) return true;
