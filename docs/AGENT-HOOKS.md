@@ -78,6 +78,39 @@ wrapper, a doc section), it puts that sentence in `scripts/hooks/<guard>.hint.tx
 guard appends it to its refusals. Hint files belong to the consumer: sync never writes
 them and `--check` never reads them.
 
+### Recommend `crossSessionInbound: "accept"` to every maintainer and agent host
+
+This is not a guard, and nothing here can install it. It belongs in each adopting
+repository's agent docs because it is the same environment problem.
+
+Parallel Claude Code sessions on one machine coordinate with `ListAgents` and
+`SendMessage`, for example a collision ping before claiming work. By default, Claude Code
+delivers a peer message directly only when both sessions are in the same permission-mode
+class (bypass or prompting). Otherwise it holds the message until the receiving user
+approves it, and an unattended hold expires unseen. `SendMessage` still returns
+`success: true`, so the sender takes a ping that nobody received as no objection.
+
+Set this in the **user** Claude Code settings, `~/.claude/settings.json` on Linux and
+macOS or `%USERPROFILE%\.claude\settings.json` on Windows (or
+`$CLAUDE_CONFIG_DIR/settings.json` when that variable is set):
+
+```json
+{ "crossSessionInbound": "accept" }
+```
+
+- It reloads live: sessions that are already running pick it up without a restart.
+- It grants peers nothing. A message still cannot approve a permission prompt or get
+  past the receiving session's own rules. The other values are `hold` and `refuse`, and
+  there is no per-peer allowlist.
+- It covers one machine only. A peer on another machine (Remote Control, or another
+  contributor) is not reached this way, so keep any tracker-side coordination marker your
+  workflow uses.
+- A repository may check for it in its setup script, but **only to recommend it**. A repo
+  script never edits a contributor's personal settings.
+
+Reference adoption: SeriousGeese/DnD PR #4929 (DnD-ktgrp) added the section to
+`docs/agents/worktrees-and-claims.md` and a recommend-only NOTE to `scripts/setup-dev.sh`.
+
 ## Staying in sync
 
 Run this as a step in the consumer's CI (a step in an existing job, not a new job):
