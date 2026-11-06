@@ -42,8 +42,8 @@
 // (an actual rebase-state directory) is cheap and unambiguous, so nothing is
 // lost by requiring it.
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { existsSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { consumerHint } from './refusal-notice.mjs';
 
@@ -121,7 +121,21 @@ export function main(cwd = process.cwd(), env = process.env) {
 // Only act when run as the hook, so the tests can import the pieces. This exact
 // comparison is the Windows-safe form a hand-built `file://${argv[1]}` never matches
 // on Windows, and the CLI then silently does nothing while exiting 0.
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   let code;
   try {
     code = main();

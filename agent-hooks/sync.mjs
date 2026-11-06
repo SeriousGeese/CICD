@@ -34,7 +34,7 @@
 // and a first adoption fetches this one file alone, so it imports no sibling either (it reads
 // agent-tooling.json's envPrefix itself rather than through agent-tooling-config.mjs).
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -382,7 +382,21 @@ async function main() {
   return 0;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   main().then(
     (code) => process.exit(code),
     (err) => {

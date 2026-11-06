@@ -10,7 +10,8 @@
 //
 // Same contract as the other SessionStart hooks: plain text on STDOUT, always exit 0, and never
 // the reason a session fails to start.
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { consumerHint } from './refusal-notice.mjs';
 
 /** The banner for `platform`, or an empty string when the host is not Windows. */
@@ -24,7 +25,21 @@ export function windowsShellPointer(platform = process.platform) {
   );
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   const banner = windowsShellPointer();
   if (banner) console.log(banner);
 }

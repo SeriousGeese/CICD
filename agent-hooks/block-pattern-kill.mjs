@@ -29,7 +29,8 @@ import { NOTHING_RAN_NOTICE, consumerHint } from './refusal-notice.mjs';
 import { readHookInput } from './hook-input.mjs';
 import { skipCommandPrefix, stripGroupingParens } from './wrapper-strip.mjs';
 import { segmentHasInlineHatch } from './inline-hatch.mjs';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const HATCH_VAR = 'AGENT_HOOKS_ALLOW_PATTERN_KILL';
 // PowerShell's call operator is a bare wrapper token there.
@@ -198,7 +199,21 @@ function main() {
 }
 
 // Windows-safe entry guard (a bare path comparison fails on Windows).
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   let code;
   try {
     code = main();

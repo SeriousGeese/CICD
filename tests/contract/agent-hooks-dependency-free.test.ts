@@ -126,4 +126,23 @@ describe('agent-hooks', () => {
     }
     expect(hits).toEqual([]);
   });
+
+  it('an entry-point check compares through realpath, so a hook reached through a link still runs', () => {
+    // node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed.
+    // A guard whose entry check compares them directly does nothing through a linked checkout:
+    // it fails open. Any line that compares the two must resolve argv[1] with realpathSync.
+    const bad: string[] = [];
+    let checks = 0;
+    for (const file of allFiles.filter((f) => f.endsWith('.mjs') && !f.endsWith('.node-test.mjs'))) {
+      readFileSync(path.join(hooksDir, file), 'utf8')
+        .split('\n')
+        .forEach((line, i) => {
+          if (!line.includes('process.argv[1]') || !line.includes('import.meta.url')) return;
+          checks += 1;
+          if (!line.includes('realpathSync(process.argv[1])')) bad.push(`${file}:${i + 1}: ${line.trim()}`);
+        });
+    }
+    expect(checks, 'found the entry checks (so a clean result means something)').toBeGreaterThan(5);
+    expect(bad).toEqual([]);
+  });
 });

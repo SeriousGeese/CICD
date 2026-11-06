@@ -4,6 +4,8 @@
  */
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmdirSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -106,6 +108,29 @@ test('the hatch works inline on the segment, or from the environment', () => {
   // PowerShell has no prefix form; an assignment in the same command is its inline hatch.
   assert.equal(run("$env:AGENT_HOOKS_ALLOW_PATTERN_KILL = '1'; Stop-Process -Name my-own-server", { tool: 'PowerShell' }).status, 0);
   assert.match(run('Stop-Process -Name node', { tool: 'PowerShell' }).stderr, /\$env:AGENT_HOOKS_ALLOW_PATTERN_KILL = '1'/);
+});
+
+test('the guard still blocks when its directory is reached through a symlink or junction', () => {
+  // node resolves import.meta.url through the link but leaves argv[1] as typed; an entry check
+  // comparing the two directly made the guard do nothing, so it failed open.
+  const parent = mkdtempSync(path.join(tmpdir(), 'agent-hooks-link-'));
+  const link = path.join(parent, 'hooks');
+  try {
+    symlinkSync(HERE, link, 'junction');
+    const r = spawnSync(process.execPath, [path.join(link, 'block-pattern-kill.mjs')], {
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'pkill node' } }),
+      encoding: 'utf8',
+      env: { ...process.env, AGENT_HOOKS_ALLOW_PATTERN_KILL: '' },
+    });
+    assert.equal(r.status, 2, r.stderr);
+  } finally {
+    try {
+      unlinkSync(link);
+    } catch {
+      rmdirSync(link);
+    }
+    rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 test('unreadable input fails open', () => {

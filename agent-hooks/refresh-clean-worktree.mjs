@@ -62,10 +62,10 @@
 // Exported so check-stale-hooks.mjs can run it FIRST and then judge staleness on
 // the post-refresh tree.
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { fillTemplate, tryLoadConfig } from './agent-tooling-config.mjs';
 
 // The dependency manifest and lockfile a package manager reads, so a fast-forward that
@@ -204,7 +204,21 @@ export function renderRefresh(r) {
   return [];
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   try {
     const lines = renderRefresh(refreshCleanWorktree());
     if (lines.length) process.stdout.write(`${lines.join('\n')}\n`);

@@ -16,9 +16,9 @@
 //
 // Never fails a session: every error is swallowed and the hook exits 0.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { closeSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { DEFAULTS, fillTemplate, findRoot, tryLoadConfig } from './agent-tooling-config.mjs';
 
 export const REPORT_NAME = 'agent-hooks-worktree-stale.txt';
@@ -145,7 +145,21 @@ export function banner({ commonDir, repoRoot, now = Date.now(), start = startDet
 }
 
 // Windows-safe entry guard: compare file URLs, not raw paths.
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   try {
     if (process.argv[2] === '--refresh') {
       refresh(process.argv[3], process.argv[4]);
