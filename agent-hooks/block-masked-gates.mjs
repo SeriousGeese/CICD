@@ -968,7 +968,9 @@ function main() {
 }
 
 // Only act when run as the hook; importing for tests must not touch the process.
-if (isMain()) process.exit(main());
+// process.exitCode, never process.exit(main()): a hard exit can drop the tail of a refusal
+// still queued on a piped stderr.
+if (isMain()) process.exitCode = main();
 
 function isMain() {
   try {
