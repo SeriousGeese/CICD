@@ -538,7 +538,8 @@ export async function sync(opts) {
       `refusing to replace ${foreign.length} existing file(s) the recorded CICD ref did not write; nothing was written: ` +
         `${foreign.map(({ f, why }) => `${label(f)} (${why})`).join(', ')}. ` +
         'If this sync should take them over (the consumer is replacing its own copy with the CICD one), re-run with --adopt; ' +
-        'if a vendored file was edited in place, move the change into CICD first.',
+        'if a vendored file was edited in place, move the change into CICD first. ' +
+        'A file that "cannot be confirmed unchanged" was not read at the recorded ref: re-run with --from a CICD checkout that has it, or once GitHub is reachable, before reaching for --adopt.',
     );
   }
 

@@ -130,7 +130,16 @@ try {
     );
     process.exit(2);
   }
-} catch {
+} catch (err) {
+  // Fail open. Malformed hook input stays silent (not this guard's business), but a filesystem
+  // error (findRoot now rethrows a stat error that is not "absent", such as EACCES or ELOOP)
+  // means an edit went unchecked, so it leaves a trace.
+  const code = /** @type {NodeJS.ErrnoException} */ (err)?.code;
+  if (code) {
+    process.stderr.write(
+      `[agent-tooling] block-primary-checkout-edits could not check this edit, allowing it: ${/** @type {Error} */ (err).message}\n`,
+    );
+  }
   process.exit(0);
 }
 
