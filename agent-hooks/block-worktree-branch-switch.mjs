@@ -85,9 +85,16 @@ try {
     const effDir = info.dashC ? resolveShellDir(curDir, info.dashC) : curDir;
     if (gitRootKind(effDir) !== 'worktree') continue;
 
-    const { config: cfg, error: cfgError } = tryLoadConfig({ from: effDir });
-    if (cfgError) process.stderr.write(`agent-tooling config ignored: ${cfgError}\n`);
-    const newWorktree = `${cfg.worktreeRoot.replace(/[\\/]+$/, '')}/${worktreeName(cfg, '<name>')}`;
+    // The block is decided; only the advice depends on config, so a failure here must still
+    // block (the outer catch fails open), with generic advice.
+    let newWorktree = '../<repo>-<name>';
+    try {
+      const { config: cfg, error: cfgError } = tryLoadConfig({ from: effDir });
+      if (cfgError) process.stderr.write(`agent-tooling config ignored: ${cfgError}\n`);
+      newWorktree = `${cfg.worktreeRoot.replace(/[\\/]+$/, '')}/${worktreeName(cfg, '<name>')}`;
+    } catch {
+      // keep the generic advice
+    }
     process.stderr.write(
       `Blocked: \`git ${info.label}\` changes this worktree's branch in place. A worktree's branch is fixed ` +
         'when the worktree is created; switching it moves the worktree HEAD and HIJACKS a shared HEAD if another ' +

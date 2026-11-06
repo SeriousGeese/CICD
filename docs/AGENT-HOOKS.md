@@ -40,9 +40,11 @@ files in the same set) and carries `sync.mjs` and the tests of every module it s
 | `all` | Every set. |
 
 The sets a consumer chose are recorded in `CICD-HOOKS-SHA` (a `sets:` line, omitted for
-`core` alone). A later `sync --ref <new>` without `--set` keeps them; naming a smaller
-selection deletes the files that dropped out. `--check` re-derives exactly the recorded
-selection.
+`core` alone), with the prefix. A later `sync --ref <new>` without `--set` keeps both.
+Naming a smaller selection is refused unless you add `--drop`: a guard that disappears while
+`.claude/settings.json` still registers it fails OPEN, silently, so unregister it first. Sets
+are not cumulative: `--set guards` does not imply `core`. `--check` re-derives exactly the
+recorded selection.
 
 ## Config: `agent-tooling.json`
 
@@ -55,15 +57,15 @@ so the config can never be the reason a tool call or a session start fails.
 | Key | Type | Default | Read by |
 |---|---|---|---|
 | `envPrefix` | `PREFIX_` | the neutral `AGENT_HOOKS_` | `sync.mjs` (default `--env-prefix`) |
-| `beadPrefix` | string or null | `null` (any prefix) | guards that recognise issue ids |
+| `beadPrefix` | string or null | `null` (any prefix) | agent-tooling (no hook here reads it yet) |
 | `packageManager` | `npm`, `pnpm`, `yarn`, `bun` | `npm` | worktree dependency hooks |
 | `worktreeRoot` | path | `..` | worktree advice in refusals |
 | `worktreeNamePattern` | string with `<slug>` (and optional `<repo>`) | `<repo>-<slug>` | worktree advice in refusals |
-| `gateWrappers` | script basenames | `["gate.sh"]` | gate-aware guards |
+| `gateWrappers` | script basenames | `["gate.sh"]` | agent-tooling (`block-masked-gates.mjs` still reads `<PREFIX>GATE_WRAPPERS`) |
 | `people` | lower-case handles | `[]` | agent-tooling's asks |
-| `claimHelper` | repo path or null | `scripts/claim.sh` | `block-bare-claim.mjs` |
+| `claimHelper` | repo path | `scripts/claim.sh` | `block-bare-claim.mjs` |
 | `emDashPaths` | repo path prefixes | `[]` (check nothing) | `block-em-dash.mjs` |
-| `worktreeScripts` | object: `new`, `await`, `install`, `rm` command templates | `bash scripts/worktree-new.sh <slug> <branch>`, `... --await <path>`, `... --install <path>`, `bash scripts/worktree-rm.sh <path>` | worktree hooks (printed or spawned) |
+| `worktreeScripts` | object: `new`, `await`, `install`, `rm`, `stale` command templates, split on whitespace when spawned | `bash scripts/worktree-new.sh <slug> <branch>`, `... --await <path>`, `... --install <path>`, `bash scripts/worktree-rm.sh <path>`, `bash scripts/worktree-rm.sh --stale` | worktree hooks (printed or spawned) |
 | `staleHookFiles` | repo paths | `[".claude/settings.json", "scripts/hooks"]` | `check-stale-hooks.mjs` |
 
 `$comment` and `$schema` keys are allowed and ignored. The script defaults are the paths
@@ -81,6 +83,59 @@ paths needs no config at all.
 
 `refusal-notice.mjs` and `shell-path-lib.mjs` are shared helpers. A repository-specific
 guard that is not shared stays in its own repository and may import both.
+
+## The `guards` set
+
+Workflow guards for repositories that run parallel agents in git worktrees with a beads
+tracker. Each names its escape hatch (`<PREFIX>ALLOW_…`) in its refusal, except
+break-glass, which has none on purpose.
+
+| Guard | Hook | Blocks | Config |
+|---|---|---|---|
+| `block-bare-claim.mjs` | PreToolUse `Bash` | A bare `bd update <id> --claim` (also inside `bash -c`, `eval`, a substitution or a script): claims go through the claim helper, which pulls first and refuses another actor's fresh claim. | `claimHelper` |
+| `block-worktree-branch-switch.mjs` | PreToolUse `Bash` | `git checkout -b` / `git switch` inside a linked worktree another session may be using; names a new-worktree command instead. | `worktreeRoot`, `worktreeNamePattern` |
+| `block-uncommitted-restore.mjs` | PreToolUse `Bash\|PowerShell` | `git checkout -- <path>` / `git restore <path>` on a target with uncommitted changes, which throws away every other edit in the file. | none |
+| `block-npx-unlisted.mjs` | PreToolUse `Bash\|PowerShell` | `npx` / `npm exec` of a package the repository neither declares nor has installed, which downloads and runs an unpinned version. | none |
+| `block-pattern-kill.mjs` | PreToolUse `Bash\|PowerShell\|Monitor` | `pkill`, `killall`, `taskkill /IM`, `Stop-Process -Name`, `pgrep` into `kill`: on a shared machine they kill other sessions' processes. | none |
+| `block-break-glass.mjs` | PreToolUse `Bash\|PowerShell\|Monitor`, `mcp__.*` | Adding a `break-glass` label, setting a `BREAK_GLASS*` variable, `gh pr merge --admin`, writing a ruleset. Human-only, no hatch. | none |
+| `block-primary-checkout-edits.mjs` | PreToolUse `Write\|Edit\|MultiEdit\|NotebookEdit` | An edit inside the consumer's primary checkout instead of a worktree. A checkout counts as the consumer's when it carries this guard at the same relative path. | `worktreeRoot`, `worktreeNamePattern` |
+| `block-orphaned-worktree-cwd.mjs` | PreToolUse `Bash\|PowerShell\|Monitor` | A command from a `.claude/worktrees/<name>` directory that lost its `.git` link, where git would silently resolve the primary checkout. | `worktreeScripts.new` |
+| `block-em-dash.mjs` | git pre-commit | Em-dashes and en-dashes that a commit ADDS to `.md`/`.txt` files under the configured paths. | `emDashPaths` |
+
+Helpers: `hook-input.mjs` (reads the tool-call JSON), `wrapper-strip.mjs` (skips `env`,
+`rtk`, `timeout`, `do`/`then` and friends before the command word), `inline-hatch.mjs` (an
+inline `<PREFIX>ALLOW_X=1 cmd` hatch scoped to one segment), `test-cleanup.mjs` and
+`windows-powershell-env.mjs` (test helpers). `guard-refusal-notice.node-test.mjs` checks every
+PreToolUse guard present carries the shared notice, and in a consumer that every guard its
+`.claude/settings.json` registers exists.
+
+## The `push` set
+
+git pre-push hooks. Wiring: SeriousGeese/agent-tooling `reference/pre-push`.
+
+| Hook | Does |
+|---|---|
+| `block-rebase-in-progress-push.mjs` | Refuses a push while a rebase is in progress (the push would succeed with the un-replayed commits missing). |
+| `warn-recreated-branch.mjs` | Warns when a push recreates a branch whose PR already merged (and was deleted), so the push has no PR. Never blocks. |
+| `warn-dropped-files.mjs` | Warns when files present at the merge-base are absent from HEAD, the sign of a stale rebase that dropped a merged commit. Never blocks. |
+| `ensure-ssh-keepalive.mjs` | Sets an SSH keepalive for the repository so a push survives a long local verify. |
+| `serialize-verify.mjs` | Runs the consumer's local verify under a per-user lock with stdin closed, with a few memory-gated concurrent slots. Knobs: `<PREFIX>VERIFY_LOCK_WAIT_SECONDS`, `<PREFIX>VERIFY_MAX_CONCURRENT`, `<PREFIX>VERIFY_SLOT_FREE_GB`, `<PREFIX>SKIP_LOCAL_VERIFY`. |
+
+## The `worktree` set
+
+SessionStart and worktree-lifecycle hooks. Wiring: SeriousGeese/agent-tooling
+`reference/settings.json`. Each prints plain text to stdout and exits 0: a SessionStart hook
+must never be the reason a session fails to start.
+
+| Hook | Does | Config |
+|---|---|---|
+| `verify-worktree-isolation.sh` | Prints a `[worktree-check]` verdict: is this session in an isolated worktree, or did the harness hand it a broken one. | `worktreeRoot`, `worktreeNamePattern` |
+| `check-stale-hooks.mjs` | Fast-forwards a clean, zero-commit worktree to `origin/main` (through `refresh-clean-worktree.mjs`), then warns when hook files are still behind. | `staleHookFiles`, `worktreeScripts` |
+| `refresh-clean-worktree.mjs` | The fast-forward itself. Hatch `<PREFIX>NO_WORKTREE_REFRESH`. | `packageManager`, `worktreeScripts.await` |
+| `normalize-worktree-eol.mjs` | Rewrites CRLF text files in a clean harness-created worktree from the index; warns on a dirty one. Logs every run through `eol-fix-log.mjs`. | none |
+| `ensure-worktree-deps.mjs` | Starts the consumer's dependency install in the background when a worktree arrives without dependencies or with stale ones. | `packageManager`, `worktreeScripts.install`, `worktreeScripts.await` |
+| `worktree-stale-banner.mjs` | One cached line naming worktrees on merged branches; refreshes the scan in the background when it is old. | `worktreeScripts.stale`, `worktreeScripts.rm` |
+| `windows-shell-pointer.mjs` | On a Windows host, points at the shell guide before the first command. | none |
 
 ## Why these are copied, not referenced
 

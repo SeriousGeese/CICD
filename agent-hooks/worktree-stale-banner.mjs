@@ -2,8 +2,8 @@
 // SessionStart hook: report merged worktrees from a cached scan, so a new session never waits for
 // one.
 //
-// The consumer's worktree removal script run with `--stale` (`worktreeScripts.rm` in agent-tooling.json,
-// which must accept that flag) used to be the hook itself, and SessionStart hooks hold the first turn.
+// The consumer's stale-worktree scan (`worktreeScripts.stale` in agent-tooling.json, default
+// `bash scripts/worktree-rm.sh --stale`) used to be the hook itself, and SessionStart hooks hold the first turn.
 // Across October it ran 318 times at a median of 147s (p90 394s); one session sat 9m52s before its
 // first message was read. Its 60-line report was the same every time, too.
 //
@@ -76,14 +76,14 @@ function gitCommonDir(cwd) {
 }
 
 /**
- * The argv of the scan: the configured removal command (`worktreeScripts.rm`) with its
- * `<placeholder>` arguments dropped and `--stale` appended, the script path resolved against
- * the repository root.
+ * The argv of the scan: the configured scan command (`worktreeScripts.stale`), split on
+ * whitespace (so a script path may not contain a space), with the script path resolved
+ * against the repository root. Its own key, never derived from `rm`: flags a consumer gives
+ * its removal command (`--force`) must not ride along into a detached background scan.
  */
 export function scanArgv(cfg, repoRoot) {
-  const tokens = cfg.worktreeScripts.rm.trim().split(/\s+/).filter((t) => !/^<[a-z]+>$/.test(t));
-  const argv = tokens.map((t, i) => (i > 0 && !t.startsWith('-') && /[\\/]|\.(sh|mjs|cjs|js)$/.test(t) ? path.resolve(repoRoot, t) : t));
-  return [...argv, '--stale'];
+  const tokens = cfg.worktreeScripts.stale.trim().split(/\s+/);
+  return tokens.map((t, i) => (i > 0 && !t.startsWith('-') && /[\\/]|\.(sh|mjs|cjs|js)$/.test(t) ? path.resolve(repoRoot, t) : t));
 }
 
 /** Takes the lock, or reports that another scan holds a live one. */

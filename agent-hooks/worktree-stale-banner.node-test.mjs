@@ -197,16 +197,18 @@ test('banner passes a configured removal command through to the line', () => {
   });
 });
 
-test('scanArgv drops placeholder arguments, resolves the script and appends --stale', () => {
+test('scanArgv runs the configured stale command with its script resolved, and never the rm command', () => {
   const root = path.resolve('/repo');
-  assert.deepEqual(scanArgv({ worktreeScripts: { rm: 'bash scripts/worktree-rm.sh <path>' } }, root), ['bash', path.resolve(root, 'scripts/worktree-rm.sh'), '--stale']);
-  assert.deepEqual(scanArgv({ worktreeScripts: { rm: 'bash tools/rm.sh <path>' } }, root), ['bash', path.resolve(root, 'tools/rm.sh'), '--stale']);
-  assert.deepEqual(scanArgv({ worktreeScripts: { rm: 'node tools/rm.mjs --prune <path>' } }, root), ['node', path.resolve(root, 'tools/rm.mjs'), '--prune', '--stale']);
+  assert.deepEqual(scanArgv({ worktreeScripts: { stale: 'bash scripts/worktree-rm.sh --stale' } }, root), ['bash', path.resolve(root, 'scripts/worktree-rm.sh'), '--stale']);
+  assert.deepEqual(scanArgv({ worktreeScripts: { stale: 'node tools/scan.mjs --merged' } }, root), ['node', path.resolve(root, 'tools/scan.mjs'), '--merged']);
+  // A --force on the removal command must not reach the background scan.
+  const argv = scanArgv({ worktreeScripts: { rm: 'bash tools/rm.sh --force <path>', stale: 'bash tools/rm.sh --stale' } }, root);
+  assert.equal(argv.includes('--force'), false);
 });
 
-test('refresh runs the configured removal script with --stale', () => {
+test('refresh runs the configured stale command', () => {
   withDir((dir) => {
-    writeFileSync(path.join(dir, 'agent-tooling.json'), JSON.stringify({ worktreeScripts: { rm: 'bash tools/rm.sh <path>' } }));
+    writeFileSync(path.join(dir, 'agent-tooling.json'), JSON.stringify({ worktreeScripts: { stale: 'bash tools/rm.sh --stale' } }));
     const calls = [];
     const ok = refresh(dir, dir, (cmd, args) => { calls.push([cmd, ...args]); return { status: 0, stdout: REPORT }; });
     assert.equal(ok, true);
@@ -217,7 +219,7 @@ test('refresh runs the configured removal script with --stale', () => {
 test('the real --refresh entry point runs a configured removal script', () => {
   withDir((dir) => {
     mkdirSync(path.join(dir, 'tools'));
-    writeFileSync(path.join(dir, 'agent-tooling.json'), JSON.stringify({ worktreeScripts: { rm: 'bash tools/rm.sh <path>' } }));
+    writeFileSync(path.join(dir, 'agent-tooling.json'), JSON.stringify({ worktreeScripts: { stale: 'bash tools/rm.sh --stale' } }));
     writeFileSync(path.join(dir, 'tools', 'rm.sh'), "printf '  MERGED  /w/z  [refs/heads/z]\\n'\n");
     const hook = fileURLToPath(new URL('./worktree-stale-banner.mjs', import.meta.url));
     const run = spawnSync(process.execPath, [hook, '--refresh', dir, dir], { encoding: 'utf8' });

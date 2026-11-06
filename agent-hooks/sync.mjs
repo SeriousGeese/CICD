@@ -17,10 +17,10 @@
 //   - rewrites the neutral `AGENT_HOOKS_` escape-hatch prefix to the consumer's prefix, so a
 //     consumer keeps the names its docs already teach (`ACME_ALLOW_DOUBLE_BACKSLASH`, …).
 //     The prefix is --env-prefix, else `envPrefix` from the consumer's agent-tooling.json,
-//     else the neutral prefix unchanged;
+//     else the prefix the last sync recorded, else the neutral prefix unchanged;
 //   - writes them into <repo>/<hooks-dir> (default scripts/hooks) with LF endings, deletes
-//     files an earlier sync vendored that the selection no longer lists (a dropped set, or a
-//     file the manifest dropped), and records the ref, prefix, sets and file list in
+//     files an earlier sync vendored that the selection no longer lists (a file the manifest
+//     dropped, or, only with --drop, a de-selected set), and records the ref, prefix, sets and file list in
 //     <hooks-dir>/CICD-HOOKS-SHA;
 //   - `--check` re-derives every recorded file from the recorded ref, prefix and sets, and
 //     exits 1 naming each one that was edited, deleted, or is missing — run it in the
@@ -53,15 +53,15 @@ export const NEUTRAL_PREFIX = ['AGENT', 'HOOKS', ''].join('_');
 const NEUTRAL_PREFIX_RE = new RegExp(String.raw`\b${NEUTRAL_PREFIX}`, 'g');
 
 const USAGE =
-  'usage: node sync.mjs --into <repo> --ref <40-hex sha> [--set <name>[,<name>]] [--env-prefix PREFIX_] [--hooks-dir scripts/hooks] [--from <cicd checkout>]\n' +
+  'usage: node sync.mjs --into <repo> --ref <40-hex sha> [--set <name>[,<name>]] [--drop] [--env-prefix PREFIX_] [--hooks-dir scripts/hooks] [--from <cicd checkout>]\n' +
   '       node sync.mjs --into <repo> --check [--hooks-dir scripts/hooks] [--from <cicd checkout>]\n';
 
 /**
  * @param {string[]} argv
- * @returns {{ into?: string, ref?: string, envPrefix?: string, sets?: string[], hooksDir: string, from?: string, check: boolean }}
+ * @returns {{ into?: string, ref?: string, envPrefix?: string, sets?: string[], drop?: boolean, hooksDir: string, from?: string, check: boolean }}
  */
 export function parseArgs(argv) {
-  /** @type {{ into?: string, ref?: string, envPrefix?: string, sets?: string[], hooksDir: string, from?: string, check: boolean }} */
+  /** @type {{ into?: string, ref?: string, envPrefix?: string, sets?: string[], drop?: boolean, hooksDir: string, from?: string, check: boolean }} */
   const out = { hooksDir: 'scripts/hooks', check: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -77,6 +77,7 @@ export function parseArgs(argv) {
     else if (a === '--hooks-dir') out.hooksDir = next();
     else if (a === '--from') out.from = next();
     else if (a === '--check') out.check = true;
+    else if (a === '--drop') out.drop = true;
     else throw new Error(`unknown argument: ${a}`);
   }
   return out;
@@ -263,19 +264,35 @@ async function manifestAt(ref, from) {
 }
 
 /**
- * @param {{ into: string, ref: string, envPrefix?: string, sets?: string[], hooksDir: string, from?: string }} opts
+ * @param {{ into: string, ref: string, envPrefix?: string, sets?: string[], drop?: boolean, hooksDir: string, from?: string }} opts
  * @returns {Promise<string[]>} the files written
  */
 export async function sync(opts) {
   const dest = hooksDest(opts.into, opts.hooksDir);
   const shaPath = path.join(dest, SHA_FILE);
   const previous = existsSync(shaPath) ? parseShaFile(readFileSync(shaPath, 'utf8')) : null;
-  const envPrefix = opts.envPrefix ?? configEnvPrefix(opts.into) ?? NEUTRAL_PREFIX;
+  // The recorded prefix comes before the neutral one, so a consumer that once passed
+  // --env-prefix and has no agent-tooling.json keeps its hatch names on a plain re-sync.
+  const envPrefix = opts.envPrefix ?? configEnvPrefix(opts.into) ?? previous?.envPrefix ?? NEUTRAL_PREFIX;
   if (!isEnvPrefix(envPrefix)) throw new Error(`env prefix must look like PREFIX_ (upper-case, ending in _): ${envPrefix}`);
 
   const manifest = await manifestAt(opts.ref, opts.from);
   const sets = opts.sets ?? previous?.sets ?? [manifest.defaultSet];
   const files = selectFiles(manifest, sets);
+  // A file the manifest still ships but the new selection leaves out is a guard being turned
+  // off, and `.claude/settings.json` may still register it: node then exits 1, which Claude Code
+  // treats as a non-blocking error, so the guard fails OPEN with no warning. `--set guards`
+  // meaning "core plus guards" is the easy mistake. Refuse unless the caller says --drop.
+  if (!opts.drop && previous) {
+    const shipped = new Set(selectFiles(manifest, [ALL_SET]));
+    const dropped = previous.files.filter((f) => !files.includes(f) && shipped.has(f));
+    if (dropped.length > 0) {
+      throw new Error(
+        `set(s) ${sets.join(',')} would stop vendoring ${dropped.length} file(s) the last sync (sets ${previous.sets.join(',')}) wrote: ${dropped.join(', ')}. ` +
+          'Unregister them from .claude/settings.json first, then re-run with --drop, or name every set you still want.',
+      );
+    }
+  }
   const contents = await Promise.all(files.map(async (f) => transform(await readAtRef(opts.ref, f, opts.from), envPrefix)));
 
   mkdirSync(dest, { recursive: true });
@@ -357,6 +374,7 @@ async function main() {
     ref: /** @type {string} */ (opts.ref),
     envPrefix: opts.envPrefix,
     sets: opts.sets,
+    drop: opts.drop,
     hooksDir: opts.hooksDir,
     from: opts.from,
   });

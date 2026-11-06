@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync, symlinkSync } from 'node:fs';
 import { removeTempDir } from './test-cleanup.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -124,8 +124,10 @@ test('stdin cwd naming a nested linked worktree wins over the process cwd', () =
     assert.doesNotMatch(out, /SHARED main checkout/);
     assert.doesNotMatch(out, /BROKEN ISOLATION/);
     assert.match(out, /OK — isolated worktree/);
-    // The banner prints git's forward-slash form; on Windows `wt` is backslashed.
-    const named = [wt, wt.split(path.sep).join('/')].some((p) => out.includes(p));
+    // The banner prints git's forward-slash form; on Windows `wt` is backslashed, and a
+    // runner's temp dir can be an 8.3 short name (RUNNER~1) that git reports expanded.
+    const long = realpathSync.native(wt);
+    const named = [wt, long].flatMap((p) => [p, p.split(path.sep).join('/')]).some((p) => out.includes(p));
     assert.ok(named, `banner should name the session worktree ${wt}:\n${out}`);
   } finally {
     removeTempDir(f.root);

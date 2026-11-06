@@ -287,7 +287,13 @@ test('a re-sync without --set keeps the recorded sets; de-selecting a set delete
     assert.deepEqual(again, ['a.mjs', 'g.mjs', 'p.mjs', 'shared.mjs']);
 
     writeFileSync(path.join(dir, 'g.hint.txt'), 'consumer-owned\n');
-    await sync({ into: dst, ref: src.sha, envPrefix: 'ACME_', sets: ['core'], hooksDir: 'scripts/hooks', from: src.root });
+    // Narrowing the selection turns guards off, so it is refused, before writing, without --drop.
+    await assert.rejects(
+      sync({ into: dst, ref: src.sha, envPrefix: 'ACME_', sets: ['core'], hooksDir: 'scripts/hooks', from: src.root }),
+      /would stop vendoring 2 file\(s\).*g\.mjs, p\.mjs.*--drop/,
+    );
+    assert.equal(existsSync(path.join(dir, 'g.mjs')), true, 'nothing was deleted by the refused sync');
+    await sync({ into: dst, ref: src.sha, envPrefix: 'ACME_', sets: ['core'], drop: true, hooksDir: 'scripts/hooks', from: src.root });
     assert.equal(existsSync(path.join(dir, 'g.mjs')), false);
     assert.equal(existsSync(path.join(dir, 'p.mjs')), false);
     assert.equal(existsSync(path.join(dir, 'shared.mjs')), true, 'a file still in a selected set stays');
@@ -351,9 +357,40 @@ test('the env prefix defaults from agent-tooling.json, and an explicit --env-pre
 
     writeFileSync(path.join(dst, CONFIG_FILE), JSON.stringify({ envPrefix: 'lower_' }));
     await assert.rejects(sync({ into: dst, ref: src.sha, hooksDir: 'scripts/hooks', from: src.root }), /PREFIX_/);
+    // With no config and no flag, the prefix the last sync recorded is kept, never reset to neutral.
     rmSync(path.join(dst, CONFIG_FILE));
     await sync({ into: dst, ref: src.sha, hooksDir: 'scripts/hooks', from: src.root });
+    assert.match(readFileSync(path.join(dst, 'scripts/hooks/g.mjs'), 'utf8'), /ACME_ALLOW_X/);
+    assert.match(readFileSync(path.join(dst, 'scripts/hooks', SHA_FILE), 'utf8'), /^env-prefix: ACME_$/m);
+  } finally {
+    rmSync(src.root, { recursive: true, force: true });
+    rmSync(dst, { recursive: true, force: true });
+  }
+});
+
+test('a first sync with no config and no flag keeps the neutral prefix', async () => {
+  const src = fakeCicdWithSets(SETS, SET_FILES);
+  const dst = consumer();
+  try {
+    await sync({ into: dst, ref: src.sha, sets: ['guards'], hooksDir: 'scripts/hooks', from: src.root });
     assert.match(readFileSync(path.join(dst, 'scripts/hooks/g.mjs'), 'utf8'), new RegExp(`${P}ALLOW_X`));
+  } finally {
+    rmSync(src.root, { recursive: true, force: true });
+    rmSync(dst, { recursive: true, force: true });
+  }
+});
+
+test('the CLI refuses a narrowing --set without --drop, and accepts it with', () => {
+  const src = fakeCicdWithSets(SETS, SET_FILES);
+  const dst = consumer();
+  const cli = (...args) => spawnSync(process.execPath, [SYNC, '--into', dst, '--ref', src.sha, '--from', src.root, ...args], { encoding: 'utf8' });
+  try {
+    assert.equal(cli('--set', 'all').status, 0);
+    const refused = cli('--set', 'core');
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /--drop/);
+    assert.equal(cli('--set', 'core', '--drop').status, 0, 'and --drop lets it through');
+    assert.equal(existsSync(path.join(dst, 'scripts/hooks/g.mjs')), false);
   } finally {
     rmSync(src.root, { recursive: true, force: true });
     rmSync(dst, { recursive: true, force: true });

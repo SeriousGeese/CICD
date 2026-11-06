@@ -109,9 +109,16 @@ try {
     if (!isConsumerCheckout(verdict.root)) continue;
     if (isExempt(filePath, verdict.root)) continue;
 
-    const { config: cfg, error } = tryLoadConfig({ root: verdict.root });
-    if (error) process.stderr.write(`[agent-tooling] ${error}\n`);
-    const suggested = `${cfg.worktreeRoot.replace(/[/\\]+$/, '')}/${worktreeName(cfg, '<name>')}`;
+    // The block is decided; only the advice depends on config, so a failure here must still
+    // block (the outer catch fails open), with generic advice.
+    let suggested = '../<repo>-<name>';
+    try {
+      const { config: cfg, error } = tryLoadConfig({ root: verdict.root });
+      if (error) process.stderr.write(`[agent-tooling] ${error}\n`);
+      suggested = `${cfg.worktreeRoot.replace(/[/\\]+$/, '')}/${worktreeName(cfg, '<name>')}`;
+    } catch {
+      // keep the generic advice
+    }
     process.stderr.write(
       `Blocked: ${filePath} is inside the PRIMARY checkout (${verdict.root}), not an isolated worktree. ` +
         'Feature work must happen in a real worktree. Create one with: ' +
