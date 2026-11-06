@@ -31,6 +31,25 @@ const manifest = JSON.parse(readFileSync(path.join(hooksDir, 'manifest.json'), '
 const allFiles = [...new Set(Object.values(manifest.sets).flat())].sort();
 const listed = new Set(allFiles);
 
+/**
+ * Exit without truncating. Node can write to a pipe asynchronously, so process.exit() may end
+ * the process with the tail of a refusal or report still queued while the status says
+ * otherwise. A shipped module sets process.exitCode and lets Node drain. The two shapes that
+ * forward a computed status straight into a hard exit are banned; a literal exit
+ * (`process.exit(0)` on a fail-open path) and the flushing form,
+ * `process.stdout.write('', () => process.exit(code))`, are not matched. The same rule as
+ * SeriousGeese/agent-tooling's tests/contract/manifest.node-test.mjs, so a consumer carrying
+ * that guardrail over its whole tree never has to exempt a vendored hook.
+ */
+const BANNED_EXIT_SHAPES = [
+  { name: 'process.exit(<call>)', re: /process\.exit\(\s*(?:await\s+)?[A-Za-z_$][\w$.]*\(/ },
+  { name: '(code) => process.exit(code)', re: /\(\s*([A-Za-z_$][\w$]*)\s*\)\s*=>\s*process\.exit\(\s*\1\s*\)/ },
+  { name: 'code => process.exit(code)', re: /(?<![\w$)])([A-Za-z_$][\w$]*)\s*=>\s*process\.exit\(\s*\1\s*\)/ },
+];
+
+const stripJsComments = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+const exitHits = (src: string) => BANNED_EXIT_SHAPES.filter((s) => s.re.test(stripJsComments(src))).map((s) => s.name);
+
 function importsOf(source: string): string[] {
   const specs: string[] = [];
   // The binding list may span lines (`import {\n a,\n} from 'x'`) but never contains a quote:
@@ -147,5 +166,25 @@ describe('agent-hooks', () => {
     }
     expect(checks, 'found the entry checks (so a clean result means something)').toBeGreaterThan(5);
     expect(bad).toEqual([]);
+  });
+
+  it('the exit-shape scan sees each banned form and passes the literal and the flushing hard exit', () => {
+    expect(exitHits('process.exit(main());')).toEqual(['process.exit(<call>)']);
+    expect(exitHits('process.exit(await run(argv));')).toEqual(['process.exit(<call>)']);
+    expect(exitHits('if (isMain()) process.exit(main());')).toEqual(['process.exit(<call>)']);
+    expect(exitHits('main().then((code) => process.exit(code));')).toEqual(['(code) => process.exit(code)']);
+    expect(exitHits('main().then(c => process.exit(c));')).toEqual(['code => process.exit(code)']);
+    expect(exitHits("process.stdout.write('', () => process.exit(code));")).toEqual([]);
+    expect(exitHits('process.exit(1); process.exitCode = code;')).toEqual([]);
+    expect(exitHits('// process.exit(main())')).toEqual([]);
+    expect(exitHits('/* main().then((code) => process.exit(code)) */')).toEqual([]);
+  });
+
+  it('no shipped module exits with process.exit(<call>) or a forwarding arrow', () => {
+    const offenders: string[] = [];
+    for (const file of allFiles.filter((f) => f.endsWith('.mjs') && !f.endsWith('.node-test.mjs'))) {
+      for (const name of exitHits(readFileSync(path.join(hooksDir, file), 'utf8'))) offenders.push(`${file}: ${name}`);
+    }
+    expect(offenders, 'set process.exitCode instead, so piped output is never truncated').toEqual([]);
   });
 });
