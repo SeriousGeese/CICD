@@ -63,8 +63,21 @@
     "push": [
       "agent-tooling-config.mjs",
       "agent-tooling-config.node-test.mjs",
+      "block-rebase-in-progress-push.mjs",
+      "block-rebase-in-progress-push.node-test.mjs",
+      "ensure-ssh-keepalive.mjs",
+      "ensure-ssh-keepalive.node-test.mjs",
+      "refusal-notice.mjs",
+      "refusal-notice.node-test.mjs",
+      "serialize-verify.mjs",
+      "serialize-verify.node-test.mjs",
       "sync.mjs",
-      "sync.node-test.mjs"
+      "sync.node-test.mjs",
+      "test-cleanup.mjs",
+      "warn-dropped-files.mjs",
+      "warn-dropped-files.node-test.mjs",
+      "warn-recreated-branch.mjs",
+      "warn-recreated-branch.node-test.mjs"
     ],
     "worktree": [
       "agent-tooling-config.mjs",
