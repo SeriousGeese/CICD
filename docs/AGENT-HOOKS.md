@@ -62,7 +62,7 @@ so the config can never be the reason a tool call or a session start fails.
 | `worktreeRoot` | path | `..` | worktree advice in refusals |
 | `worktreeNamePattern` | string with `<slug>` (and optional `<repo>`) | `<repo>-<slug>` | worktree advice in refusals |
 | `gateWrappers` | script basenames | `["gate.sh"]` | agent-tooling (`block-masked-gates.mjs` still reads `<PREFIX>GATE_WRAPPERS`) |
-| `people` | lower-case handles | `[]` | agent-tooling's asks |
+| `people` | lower-case handles, or `{ handle, display?, actorBases?, emails? }` objects (`peopleOf(cfg)` normalises both) | `[]` | agent-tooling's asks |
 | `claimHelper` | repo path | `scripts/claim.sh` | `block-bare-claim.mjs` |
 | `emDashPaths` | repo path prefixes | `[]` (check nothing) | `block-em-dash.mjs` |
 | `worktreeScripts` | object: `new`, `await`, `install`, `rm`, `stale` command templates, split on whitespace when spawned | `bash scripts/worktree-new.sh <slug> <branch>`, `... --await <path>`, `... --install <path>`, `bash scripts/worktree-rm.sh <path>`, `bash scripts/worktree-rm.sh --stale` | worktree hooks (printed or spawned) |
