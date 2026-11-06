@@ -319,7 +319,7 @@ test('malformed hook input fails open', () => {
 });
 
 // ── Loop / conditional / grouping bodies ──────────────────────
-// Shared keyword stripping (lib/wrapper-strip.mjs): a switch inside a compound
+// Shared keyword stripping (wrapper-strip.mjs): a switch inside a compound
 // command's body is seen exactly as it is bare.
 for (const command of [
   'for b in x; do git switch other-branch; done',

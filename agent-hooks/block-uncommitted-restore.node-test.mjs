@@ -585,7 +585,7 @@ test('malformed hook input fails open', () => {
 // ── Loop / conditional / grouping bodies ──────────────────────
 // The command is split on `;`, `&&`, `||`, `|` and newlines, so a restore inside
 // a compound command arrives as a segment led by a shell keyword (`do`, `then`,
-// `else`, `{`, `(`, `!`). Before lib/wrapper-strip.mjs those segments were not
+// `else`, `{`, `(`, `!`). Before wrapper-strip.mjs those segments were not
 // recognised as git invocations at all and a dirty target was discarded.
 const COMPOUND_SHAPES = [
   ['for … do', 'for f in a; do git checkout -- a.txt; done'],

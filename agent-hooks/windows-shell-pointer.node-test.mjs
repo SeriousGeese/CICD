@@ -27,28 +27,36 @@ test('prints nothing on any other platform', () => {
   }
 });
 
-test('names no consumer-specific document', () => {
-  assert.doesNotMatch(windowsShellPointer('win32'), /docs\/|AGENTS\.md/);
-});
-
-// The hint file is the consumer's own and sits beside the vendored hook, so the test copies the hook
-// (and the module it imports) into a scratch directory and drops a hint there.
-test('a consumer hint file is appended to the banner', () => {
+// The hint file is the consumer's own and sits beside the vendored hook, so these tests copy the
+// hook (and the module it imports) into a scratch directory, with or without a hint, and read the
+// banner from there. Reading it from `here` would include whatever hint THIS checkout carries.
+function bannerFromScratch(hint) {
   const dir = mkdtempSync(path.join(tmpdir(), 'agent-hooks-win-pointer-'));
   try {
     for (const f of ['windows-shell-pointer.mjs', 'refusal-notice.mjs']) copyFileSync(path.join(here, f), path.join(dir, f));
-    writeFileSync(path.join(dir, 'windows-shell-pointer.hint.txt'), 'Read docs/shell-notes.md first.\n');
+    if (hint !== undefined) writeFileSync(path.join(dir, 'windows-shell-pointer.hint.txt'), hint);
     const r = spawnSync(
       process.execPath,
       ['--input-type=module', '-e', `import { windowsShellPointer } from ${JSON.stringify(`file:///${path.join(dir, 'windows-shell-pointer.mjs').replace(/\\/g, '/')}`)}; console.log(windowsShellPointer('win32'));`],
       { encoding: 'utf8' },
     );
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /^\[windows-shell\] This is a Windows host\./);
-    assert.match(r.stdout, /Read docs\/shell-notes\.md first\.$/m);
+    return r.stdout;
   } finally {
     removeTempDir(dir, 'windows-shell-pointer.node-test');
   }
+}
+
+test('the shared banner names no consumer-specific document', () => {
+  const banner = bannerFromScratch();
+  assert.match(banner, /^\[windows-shell\] This is a Windows host\./);
+  assert.doesNotMatch(banner, /docs\/|AGENTS\.md/);
+});
+
+test('a consumer hint file is appended to the banner', () => {
+  const banner = bannerFromScratch('Read docs/shell-notes.md first.\n');
+  assert.match(banner, /^\[windows-shell\] This is a Windows host\./);
+  assert.match(banner, /Read docs\/shell-notes\.md first\.$/m);
 });
 
 test('run directly it prints the banner only on win32', () => {

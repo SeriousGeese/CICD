@@ -102,7 +102,7 @@ process.exit(0);
 
 // Tokens after `npx` / `npm exec` / `npm x`, skipping the usual leading wrappers
 // and shell keywords (VAR=val, env [..], rtk [proxy], sudo/nice/..., timeout, do/then/…)
-// via lib/wrapper-strip.mjs, plus PowerShell's `&` call operator. Null when the
+// via wrapper-strip.mjs, plus PowerShell's `&` call operator. Null when the
 // segment is not a package-exec invocation.
 function execArgs(toks) {
   const i = skipCommandPrefix(toks, { extraWrappers: EXTRA_WRAPPERS });

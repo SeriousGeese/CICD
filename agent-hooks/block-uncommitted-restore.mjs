@@ -180,7 +180,7 @@ function isDirectory(p) {
 }
 
 // The tokens AFTER `git`, or null when the segment is not a git invocation, once
-// leading wrappers and shell keywords are skipped (lib/wrapper-strip.mjs, shared
+// leading wrappers and shell keywords are skipped (wrapper-strip.mjs, shared
 // with block-bare-claim.mjs and block-worktree-branch-switch.mjs).
 function gitArgsAfterWrappers(toks) {
   const i = skipCommandPrefix(toks);
