@@ -23,9 +23,13 @@ import { describe, expect, it } from 'vitest';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hooksDir = path.resolve(here, '..', '..', 'agent-hooks');
 const manifest = JSON.parse(readFileSync(path.join(hooksDir, 'manifest.json'), 'utf8')) as {
+  default: string;
   files: string[];
+  sets: Record<string, string[]>;
 };
-const listed = new Set(manifest.files);
+/** Every vendorable file: the union of the named sets (what `sync --set all` writes). */
+const allFiles = [...new Set(Object.values(manifest.sets).flat())].sort();
+const listed = new Set(allFiles);
 
 function importsOf(source: string): string[] {
   const specs: string[] = [];
@@ -41,10 +45,47 @@ function importsOf(source: string): string[] {
 }
 
 describe('agent-hooks', () => {
-  it('the manifest lists exactly the files in agent-hooks/', () => {
+  it('the manifest sets together list exactly the files in agent-hooks/', () => {
     const onDisk = readdirSync(hooksDir).filter((f) => f !== 'manifest.json').sort();
-    expect([...listed].sort()).toEqual(onDisk);
+    expect(allFiles).toEqual(onDisk);
   });
+
+  it('"files" is the default set, core, so an older sync.mjs still vendors exactly that', () => {
+    expect(manifest.default).toBe('core');
+    expect([...manifest.files].sort()).toEqual([...manifest.sets.core].sort());
+  });
+
+  it('"all" is not a manifest set: sync computes it as the union', () => {
+    expect(Object.keys(manifest.sets)).not.toContain('all');
+  });
+
+  for (const [name, files] of Object.entries(manifest.sets)) {
+    it(`set "${name}" carries sync.mjs and its tests, so a consumer of that set alone can re-sync and check`, () => {
+      expect(files).toContain('sync.mjs');
+      expect(files).toContain('sync.node-test.mjs');
+    });
+
+    it(`set "${name}" is closed: every .mjs imports only node: builtins and files in the same set`, () => {
+      const inSet = new Set(files);
+      const bad: string[] = [];
+      for (const file of files.filter((f) => f.endsWith('.mjs'))) {
+        for (const spec of importsOf(readFileSync(path.join(hooksDir, file), 'utf8'))) {
+          if (spec.startsWith('node:')) continue;
+          const sibling = /^\.\/([^/]+)$/.exec(spec)?.[1];
+          if (!(sibling && inSet.has(sibling))) bad.push(`${file} -> ${spec}`);
+        }
+      }
+      expect(bad, `set "${name}" would break when vendored on its own`).toEqual([]);
+    });
+
+    it(`set "${name}" ships the node:test suite of every module it ships`, () => {
+      const missing = files
+        .filter((f) => f.endsWith('.mjs') && !f.endsWith('.node-test.mjs'))
+        .map((f) => f.replace(/\.mjs$/, '.node-test.mjs'))
+        .filter((t) => readdirSync(hooksDir).includes(t) && !files.includes(t));
+      expect(missing).toEqual([]);
+    });
+  }
 
   it('import extraction sees real imports (so an empty result below means something)', () => {
     const specs = importsOf(readFileSync(path.join(hooksDir, 'block-masked-gates.mjs'), 'utf8'));
@@ -64,7 +105,7 @@ describe('agent-hooks', () => {
     expect(importsOf(forms).sort()).toEqual(['pkg-a', 'pkg-b', 'pkg-c', 'pkg-d', 'pkg-e', 'pkg-f', 'pkg-g', 'pkg-h']);
   });
 
-  for (const file of manifest.files.filter((f) => f.endsWith('.mjs'))) {
+  for (const file of allFiles.filter((f) => f.endsWith('.mjs'))) {
     it(`${file} imports only node: builtins and manifest siblings`, () => {
       const bad = importsOf(readFileSync(path.join(hooksDir, file), 'utf8')).filter((spec) => {
         if (spec.startsWith('node:')) return false;
@@ -77,7 +118,7 @@ describe('agent-hooks', () => {
 
   it('carries no consumer name or consumer escape-hatch prefix', () => {
     const hits: string[] = [];
-    for (const file of manifest.files) {
+    for (const file of allFiles) {
       const text = readFileSync(path.join(hooksDir, file), 'utf8');
       text.split('\n').forEach((line, i) => {
         if (/\bDnD\b|\bDND_|\bPROMPTCI_|promptci-cloud|tooling-oddities/i.test(line)) hits.push(`${file}:${i + 1}: ${line.trim()}`);

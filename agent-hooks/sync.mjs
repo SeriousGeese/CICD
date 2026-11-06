@@ -1,6 +1,6 @@
 // Vendor the shared Claude Code guard set into a consumer repository, pinned by SHA.
 //
-//   node <hooks-dir>/sync.mjs --into <repo> --ref <40-hex CICD sha> [--env-prefix ACME_]
+//   node <hooks-dir>/sync.mjs --into <repo> --ref <40-hex CICD sha> [--set core,guards] [--env-prefix ACME_]
 //   node <hooks-dir>/sync.mjs --into <repo> --check
 //
 // Why vendoring, not a GitHub Action: Claude Code hooks run LOCALLY, from
@@ -11,21 +11,28 @@
 // the pin is a commit SHA, the same way this repository's actions are consumed.
 //
 // What it does:
-//   - reads agent-hooks/manifest.json at --ref, then every file it lists;
-//   - rewrites the neutral `AGENT_HOOKS_` escape-hatch prefix to --env-prefix, so a consumer
-//     keeps the names its docs already teach (`ACME_ALLOW_DOUBLE_BACKSLASH`, …);
+//   - reads agent-hooks/manifest.json at --ref, picks the files of the named sets
+//     (`--set`, comma-separated; `all` is every set; default: the sets recorded by the last
+//     sync, else the manifest's default set, `core`), then reads every one of them;
+//   - rewrites the neutral `AGENT_HOOKS_` escape-hatch prefix to the consumer's prefix, so a
+//     consumer keeps the names its docs already teach (`ACME_ALLOW_DOUBLE_BACKSLASH`, …).
+//     The prefix is --env-prefix, else `envPrefix` from the consumer's agent-tooling.json,
+//     else the neutral prefix unchanged;
 //   - writes them into <repo>/<hooks-dir> (default scripts/hooks) with LF endings, deletes
-//     files an earlier sync vendored that the manifest no longer lists, and records the ref,
-//     prefix and file list in <hooks-dir>/CICD-HOOKS-SHA;
-//   - `--check` re-derives every recorded file from the recorded ref and prefix and exits 1
-//     naming each one that was edited, deleted, or is missing — run it in the consumer's CI
-//     so a local edit to a vendored guard cannot drift silently.
+//     files an earlier sync vendored that the selection no longer lists (a dropped set, or a
+//     file the manifest dropped), and records the ref, prefix, sets and file list in
+//     <hooks-dir>/CICD-HOOKS-SHA;
+//   - `--check` re-derives every recorded file from the recorded ref, prefix and sets, and
+//     exits 1 naming each one that was edited, deleted, or is missing — run it in the
+//     consumer's CI so a local edit to a vendored guard cannot drift silently.
 //
 // Source: raw.githubusercontent.com (this repository is public, so no token is needed), or
 // `--from <local CICD checkout>` to read the ref with `git show` instead (offline, and tests).
 // `<guard>.hint.txt` files are the consumer's own and are never read, written or checked.
 //
-// Dependency-free on purpose: a consumer with no package.json runs this with plain `node`.
+// Dependency-free on purpose: a consumer with no package.json runs this with plain `node`,
+// and a first adoption fetches this one file alone, so it imports no sibling either (it reads
+// agent-tooling.json's envPrefix itself rather than through agent-tooling-config.mjs).
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -34,6 +41,11 @@ import { fileURLToPath } from 'node:url';
 export const REPO = 'SeriousGeese/CICD';
 export const SOURCE_DIR = 'agent-hooks';
 export const SHA_FILE = 'CICD-HOOKS-SHA';
+export const CONFIG_FILE = 'agent-tooling.json';
+/** The set a consumer gets when it names none: the guard set every consumer had before named sets. */
+export const DEFAULT_SET = 'core';
+/** Not a manifest entry: the union of every set. */
+export const ALL_SET = 'all';
 // Assembled, never written as one literal: this file is itself vendored through transform(),
 // and a literal here would be rewritten to the consumer's prefix, after which the consumer's
 // copy could no longer recognise (or re-derive) the source text it checks against.
@@ -41,16 +53,16 @@ export const NEUTRAL_PREFIX = ['AGENT', 'HOOKS', ''].join('_');
 const NEUTRAL_PREFIX_RE = new RegExp(String.raw`\b${NEUTRAL_PREFIX}`, 'g');
 
 const USAGE =
-  'usage: node sync.mjs --into <repo> --ref <40-hex sha> [--env-prefix PREFIX_] [--hooks-dir scripts/hooks] [--from <cicd checkout>]\n' +
+  'usage: node sync.mjs --into <repo> --ref <40-hex sha> [--set <name>[,<name>]] [--env-prefix PREFIX_] [--hooks-dir scripts/hooks] [--from <cicd checkout>]\n' +
   '       node sync.mjs --into <repo> --check [--hooks-dir scripts/hooks] [--from <cicd checkout>]\n';
 
 /**
  * @param {string[]} argv
- * @returns {{ into?: string, ref?: string, envPrefix: string, hooksDir: string, from?: string, check: boolean }}
+ * @returns {{ into?: string, ref?: string, envPrefix?: string, sets?: string[], hooksDir: string, from?: string, check: boolean }}
  */
 export function parseArgs(argv) {
-  /** @type {{ into?: string, ref?: string, envPrefix: string, hooksDir: string, from?: string, check: boolean }} */
-  const out = { envPrefix: NEUTRAL_PREFIX, hooksDir: 'scripts/hooks', check: false };
+  /** @type {{ into?: string, ref?: string, envPrefix?: string, sets?: string[], hooksDir: string, from?: string, check: boolean }} */
+  const out = { hooksDir: 'scripts/hooks', check: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => {
@@ -61,12 +73,23 @@ export function parseArgs(argv) {
     if (a === '--into') out.into = next();
     else if (a === '--ref') out.ref = next();
     else if (a === '--env-prefix') out.envPrefix = next();
+    else if (a === '--set') out.sets = [...(out.sets ?? []), ...parseSetList(next())];
     else if (a === '--hooks-dir') out.hooksDir = next();
     else if (a === '--from') out.from = next();
     else if (a === '--check') out.check = true;
     else throw new Error(`unknown argument: ${a}`);
   }
   return out;
+}
+
+/** `core, guards` -> ['core', 'guards']; an empty list is an error. */
+export function parseSetList(text) {
+  const names = String(text)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (names.length === 0) throw new Error('--set needs at least one set name');
+  return names;
 }
 
 /** A full commit SHA. A branch or tag is a mutable pointer and is refused. */
@@ -89,13 +112,20 @@ export function transform(text, envPrefix) {
   return envPrefix === NEUTRAL_PREFIX ? lf : lf.replace(NEUTRAL_PREFIX_RE, envPrefix);
 }
 
-/** @param {{ ref: string, envPrefix: string, files: string[] }} rec */
+/**
+ * The SHA file. A sync of the default set alone writes no `sets:` line, so a consumer that
+ * never chose a set gets byte-for-byte the record it got before named sets existed.
+ * @param {{ ref: string, envPrefix: string, sets?: string[], files: string[] }} rec
+ */
 export function formatShaFile(rec) {
+  const sets = rec.sets ?? [DEFAULT_SET];
+  const defaultOnly = sets.length === 1 && sets[0] === DEFAULT_SET;
   return [
     `# Vendored from ${REPO} ${SOURCE_DIR}/ by sync.mjs. Do not edit these files here:`,
     '# change them in CICD, then re-run sync with the new ref. `sync.mjs --check` fails on drift.',
     `ref: ${rec.ref}`,
     `env-prefix: ${rec.envPrefix}`,
+    ...(defaultOnly ? [] : [`sets: ${sets.join(',')}`]),
     'files:',
     ...rec.files.map((f) => `  ${f}`),
     '',
@@ -106,13 +136,14 @@ export function formatShaFile(rec) {
 export function parseShaFile(text) {
   const ref = /^ref:\s*(\S+)\s*$/m.exec(text)?.[1];
   const envPrefix = /^env-prefix:\s*(\S+)\s*$/m.exec(text)?.[1];
+  const setsLine = /^sets:\s*(\S+)\s*$/m.exec(text)?.[1];
   const block = /^files:\s*\n([\s\S]*)$/m.exec(text)?.[1] ?? '';
   const files = block
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
   if (!ref || !envPrefix) throw new Error(`${SHA_FILE} is missing its ref or env-prefix line`);
-  return { ref, envPrefix, files };
+  return { ref, envPrefix, sets: setsLine ? parseSetList(setsLine) : [DEFAULT_SET], files };
 }
 
 /**
@@ -138,6 +169,23 @@ export function isSafeFileName(name) {
 }
 
 /**
+ * `envPrefix` from the consumer's agent-tooling.json, or undefined when the file or the key
+ * is absent. Only that one key is read here; agent-tooling-config.mjs validates the rest.
+ * @param {string} into
+ */
+export function configEnvPrefix(into) {
+  const file = path.join(path.resolve(into), CONFIG_FILE);
+  if (!existsSync(file)) return undefined;
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw new Error(`${file}: not valid JSON (${/** @type {Error} */ (err).message})`, { cause: err });
+  }
+  return typeof raw?.envPrefix === 'string' ? raw.envPrefix : undefined;
+}
+
+/**
  * Read `agent-hooks/<name>` at `ref`.
  * @param {string} ref
  * @param {string} name
@@ -159,36 +207,83 @@ async function readAtRef(ref, name, from) {
 }
 
 /**
- * The manifest file list at `ref`, validated.
- * @param {string} ref
- * @param {string | undefined} from
- * @returns {Promise<string[]>}
+ * A parsed, validated manifest: its named sets and the legacy `files` list. A manifest from
+ * before named sets has only `files`, which is then the one set, `core`.
+ * @param {unknown} json
+ * @param {string} [where]
+ * @returns {{ sets: Record<string, string[]>, defaultSet: string }}
  */
-async function manifestAt(ref, from) {
-  const files = JSON.parse(await readAtRef(ref, 'manifest.json', from))?.files;
-  if (!Array.isArray(files) || files.length === 0) throw new Error(`manifest.json at ${ref} lists no files`);
-  for (const f of files) if (!isSafeFileName(f)) throw new Error(`manifest.json at ${ref} lists an unsafe name: ${f}`);
-  return files;
+export function parseManifest(json, where = 'manifest.json') {
+  const m = /** @type {{ files?: unknown, sets?: unknown, default?: unknown }} */ (json ?? {});
+  const rawSets = m.sets === undefined ? { [DEFAULT_SET]: m.files } : m.sets;
+  if (!rawSets || typeof rawSets !== 'object' || Array.isArray(rawSets)) throw new Error(`${where} "sets" must be an object`);
+  /** @type {Record<string, string[]>} */
+  const sets = {};
+  for (const [name, files] of Object.entries(rawSets)) {
+    if (name === ALL_SET) throw new Error(`${where} must not define "${ALL_SET}": it is the union of every set`);
+    if (!/^[a-z][a-z0-9-]*$/.test(name)) throw new Error(`${where} has an invalid set name: ${name}`);
+    if (!Array.isArray(files) || files.length === 0) throw new Error(`${where} set "${name}" lists no files`);
+    for (const f of files) if (!isSafeFileName(f)) throw new Error(`${where} lists an unsafe name: ${f}`);
+    sets[name] = [...files];
+  }
+  const defaultSet = typeof m.default === 'string' ? m.default : DEFAULT_SET;
+  if (!sets[defaultSet]) throw new Error(`${where} names a default set that does not exist: ${defaultSet}`);
+  if (m.sets !== undefined && m.files !== undefined) {
+    // An older sync.mjs reads `files` only, so `files` must stay the default set.
+    const legacy = Array.isArray(m.files) ? [...m.files].sort().join('\n') : '';
+    if (legacy !== [...sets[defaultSet]].sort().join('\n')) {
+      throw new Error(`${where} "files" must list exactly the default set "${defaultSet}" (older sync.mjs copies read it)`);
+    }
+  }
+  return { sets, defaultSet };
 }
 
 /**
- * @param {{ into: string, ref: string, envPrefix: string, hooksDir: string, from?: string }} opts
+ * The sorted, de-duplicated files of the named sets. `all` is every set.
+ * @param {{ sets: Record<string, string[]> }} manifest
+ * @param {string[]} names
+ */
+export function selectFiles(manifest, names) {
+  const known = Object.keys(manifest.sets);
+  const picked = new Set();
+  for (const name of names) {
+    const lists = name === ALL_SET ? Object.values(manifest.sets) : [manifest.sets[name]];
+    if (!lists[0]) throw new Error(`unknown set "${name}" (known: ${[...known, ALL_SET].join(', ')})`);
+    for (const list of lists) for (const f of list) picked.add(f);
+  }
+  return [...picked].sort();
+}
+
+/**
+ * @param {string} ref
+ * @param {string | undefined} from
+ */
+async function manifestAt(ref, from) {
+  return parseManifest(JSON.parse(await readAtRef(ref, 'manifest.json', from)), `manifest.json at ${ref}`);
+}
+
+/**
+ * @param {{ into: string, ref: string, envPrefix?: string, sets?: string[], hooksDir: string, from?: string }} opts
  * @returns {Promise<string[]>} the files written
  */
 export async function sync(opts) {
   const dest = hooksDest(opts.into, opts.hooksDir);
-  const files = await manifestAt(opts.ref, opts.from);
-  const contents = await Promise.all(files.map(async (f) => transform(await readAtRef(opts.ref, f, opts.from), opts.envPrefix)));
-
   const shaPath = path.join(dest, SHA_FILE);
-  const previous = existsSync(shaPath) ? parseShaFile(readFileSync(shaPath, 'utf8')).files : [];
+  const previous = existsSync(shaPath) ? parseShaFile(readFileSync(shaPath, 'utf8')) : null;
+  const envPrefix = opts.envPrefix ?? configEnvPrefix(opts.into) ?? NEUTRAL_PREFIX;
+  if (!isEnvPrefix(envPrefix)) throw new Error(`env prefix must look like PREFIX_ (upper-case, ending in _): ${envPrefix}`);
+
+  const manifest = await manifestAt(opts.ref, opts.from);
+  const sets = opts.sets ?? previous?.sets ?? [manifest.defaultSet];
+  const files = selectFiles(manifest, sets);
+  const contents = await Promise.all(files.map(async (f) => transform(await readAtRef(opts.ref, f, opts.from), envPrefix)));
 
   mkdirSync(dest, { recursive: true });
   files.forEach((f, i) => writeFileSync(path.join(dest, f), contents[i]));
-  for (const stale of previous) {
+  for (const stale of previous?.files ?? []) {
     if (!files.includes(stale) && isSafeFileName(stale)) rmSync(path.join(dest, stale), { force: true });
   }
-  writeFileSync(shaPath, formatShaFile({ ref: opts.ref, envPrefix: opts.envPrefix, files }));
+  writeFileSync(shaPath, formatShaFile({ ref: opts.ref, envPrefix, sets, files }));
   return files;
 }
 
@@ -203,10 +298,16 @@ export async function check(opts) {
   const rec = parseShaFile(readFileSync(shaPath, 'utf8'));
   const problems = [];
   const manifest = await manifestAt(rec.ref, opts.from);
-  if (manifest.join('\n') !== rec.files.join('\n')) {
-    problems.push(`${SHA_FILE} file list does not match manifest.json at ${rec.ref} — re-run sync`);
+  let wanted;
+  try {
+    wanted = selectFiles(manifest, rec.sets);
+  } catch (err) {
+    return [`${SHA_FILE} records ${/** @type {Error} */ (err).message} at ${rec.ref}`];
   }
-  for (const f of manifest) {
+  if ([...rec.files].sort().join('\n') !== wanted.join('\n')) {
+    problems.push(`${SHA_FILE} file list does not match set(s) ${rec.sets.join(',')} in manifest.json at ${rec.ref} — re-run sync`);
+  }
+  for (const f of wanted) {
     const local = path.join(dest, f);
     if (!existsSync(local)) {
       problems.push(`${path.join(opts.hooksDir, f)}: missing`);
@@ -247,11 +348,18 @@ async function main() {
     process.stderr.write(`sync.mjs: --ref must be a full 40-hex commit SHA (a branch or tag can move): ${opts.ref}\n`);
     return 2;
   }
-  if (!isEnvPrefix(opts.envPrefix)) {
+  if (opts.envPrefix !== undefined && !isEnvPrefix(opts.envPrefix)) {
     process.stderr.write(`sync.mjs: --env-prefix must look like PREFIX_ (upper-case, ending in _): ${opts.envPrefix}\n`);
     return 2;
   }
-  const files = await sync({ into: opts.into, ref: /** @type {string} */ (opts.ref), envPrefix: opts.envPrefix, hooksDir: opts.hooksDir, from: opts.from });
+  const files = await sync({
+    into: opts.into,
+    ref: /** @type {string} */ (opts.ref),
+    envPrefix: opts.envPrefix,
+    sets: opts.sets,
+    hooksDir: opts.hooksDir,
+    from: opts.from,
+  });
   process.stdout.write(`synced ${files.length} files from ${REPO}@${opts.ref} into ${path.join(opts.into, opts.hooksDir)}\n`);
   return 0;
 }
