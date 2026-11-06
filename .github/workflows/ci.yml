@@ -60,3 +60,22 @@ jobs:
       # run in consumer repos that may have no package manager at all (docs/AGENT-HOOKS.md).
       - name: Agent hook tests
         run: pnpm test:agent-hooks
+
+  # Most of agent-hooks/ exists because of Windows (Git Bash path mangling, PowerShell,
+  # CRLF checkouts), and its consumers' agents mostly run there, so its suites run on a
+  # Windows host too. No install step, on purpose: the hooks are dependency-free, and a
+  # suite that only passes with node_modules present would fail here.
+  agent-hooks-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Agent hook tests (Windows)
+        shell: bash
+        run: node --test "agent-hooks/*.node-test.mjs"
