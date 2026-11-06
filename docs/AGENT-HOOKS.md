@@ -167,6 +167,36 @@ consumer's `agent-tooling.json`, else the neutral one. After that the
 consumer runs its own vendored copy: `node scripts/hooks/sync.mjs …`. A branch or tag is
 refused as `--ref`: it can move.
 
+### What sync will not overwrite or delete
+
+Sync only replaces files it wrote. A target that already exists must either equal the new
+bytes or still be byte-for-byte what the recorded ref wrote there, under the recorded
+prefix (CRLF from an autocrlf checkout does not count as an edit). Anything else stops the
+whole sync before a single file is written, and the refusal lists every such path:
+
+- a consumer's own file at a name the manifest ships (a first adoption over hand-written
+  guards, or a new set that adds a name the consumer already uses);
+- a vendored file that was edited in place.
+
+When the consumer really is replacing its own copies with the CICD ones, re-run with
+`--adopt`: each adopted path is named on stderr. An edit made in place belongs in CICD
+instead. A normal re-sync to a newer ref, over files the previous ref wrote, needs no flag.
+
+Deletes are as careful. A file the new selection no longer lists (the manifest dropped it,
+or `--drop` de-selected its set) is deleted only while its bytes are still exactly what the
+recorded ref wrote. An edited one, or a name the recorded ref never shipped, is **kept**,
+sync prints `not deleting stale <path>: <why>` on stderr, and the new record no longer
+lists it: it is the consumer's from then on, so delete it by hand if it is not wanted.
+
+Sync also refuses, before writing anything, a target or record that is a symlink, a
+directory or another non-regular file, a hooks directory under a file, and any path whose
+real location (through symlinks and junctions) is outside `--into`. It reads and checks
+everything first, then writes each file through a temp file renamed over it (a hard link
+is replaced, never written through, and the file's mode is kept), then the record, then
+the stale deletes, so a failure never leaves a half-synced tree behind a record that
+claims otherwise. With `--from`, the ref is read with `git --no-replace-objects` and
+fsmonitor off, so a pinned SHA means the same bytes in every checkout.
+
 Then register the guards in `.claude/settings.json`:
 
 | Matcher | Guards |
@@ -243,7 +273,8 @@ node scripts/hooks/sync.mjs --into . --check
 ```
 
 It re-derives every vendored file from the recorded ref and prefix and exits 1, naming
-each file that was edited in place, deleted, or is missing. A vendored guard is changed
+each file that was edited in place, deleted, is missing, or is not a regular file (a
+directory or a symlink where a vendored file belongs). A vendored guard is changed
 **here**, then each consumer re-runs sync with the new ref; the diff in the consumer is
 the change plus the ref line. It fetches from `raw.githubusercontent.com` (this repository
 is public, so no token is needed); `--from <local CICD checkout>` reads the ref with
