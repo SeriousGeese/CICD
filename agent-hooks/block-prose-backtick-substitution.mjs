@@ -46,7 +46,8 @@
 //
 // Blocking contract: exit 2 + stderr message (fed back to the agent). Anything
 // unexpected fails OPEN (exit 0) — this guard must never break Bash.
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { NOTHING_RAN_NOTICE, consumerHint } from './refusal-notice.mjs';
 
 /** Commands whose arguments are prose, so a backtick is a mistake rather than an intent. */
@@ -173,7 +174,20 @@ export function blockMessage(hit) {
 }
 
 // Executed as a hook (not imported by the node-test).
-if (process.argv[1] && process.argv[1].endsWith('block-prose-backtick-substitution.mjs')) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, and
+ * a name check misses a file linked under another name; either way the guard would do nothing.
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   try {
     if (process.env.AGENT_HOOKS_ALLOW_PROSE_BACKTICK === '1') process.exit(0);
 

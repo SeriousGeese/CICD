@@ -24,6 +24,7 @@
 //   prints one line to stderr when it sets the value; silent otherwise. Always exits 0 in repair
 //   mode (it must never fail a push); --check exits 1 when the value would be set.
 
+import { realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,7 +53,21 @@ export function ensureSshKeepalive({ cwd = process.cwd(), env = process.env, che
   return set.status === 0 ? { changed: true } : { changed: false, reason: (set.stderr || '').trim() };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   const check = process.argv.includes('--check');
   const r = ensureSshKeepalive({ check });
   if (r.changed) {

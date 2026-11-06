@@ -126,4 +126,26 @@ describe('agent-hooks', () => {
     }
     expect(hits).toEqual([]);
   });
+
+  it('an entry-point check compares through realpath, so a hook reached through a link still runs', () => {
+    // node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed.
+    // A guard whose entry check compares them directly does nothing through a linked checkout:
+    // it fails open, and so does a name check (`argv[1].endsWith(...)`) for a file linked under
+    // another name. So argv[1] may appear in a shipped module only inside the realpath
+    // comparison, on its own line: that also catches a check split across two lines.
+    const bad: string[] = [];
+    let checks = 0;
+    for (const file of allFiles.filter((f) => f.endsWith('.mjs') && !f.endsWith('.node-test.mjs'))) {
+      readFileSync(path.join(hooksDir, file), 'utf8')
+        .split('\n')
+        .forEach((line, i) => {
+          if (!line.includes('process.argv[1]')) return;
+          checks += 1;
+          const realpathCompare = /realpathSync\(process\.argv\[1\]\)\s*===\s*realpathSync\(fileURLToPath\(import\.meta\.url\)\)/;
+          if (!realpathCompare.test(line)) bad.push(`${file}:${i + 1}: ${line.trim()}`);
+        });
+    }
+    expect(checks, 'found the entry checks (so a clean result means something)').toBeGreaterThan(5);
+    expect(bad).toEqual([]);
+  });
 });

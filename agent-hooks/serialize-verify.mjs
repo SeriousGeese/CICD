@@ -34,10 +34,10 @@
 // already busy with other verifies (or anything else) falls back to one at a time by itself. An
 // older hook that knows only `<lock dir>` still serializes against the first slot.
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 export const STAMP_GRACE_MS = 5_000;
 export const MAX_HOLD_MS = 2 * 60 * 60 * 1000;
@@ -210,6 +210,20 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 }
 
 // Windows-safe entry guard: a hand-built file:// URL never matches argv[1] on Windows.
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+/**
+ * True when this module is the process entry point. Compared through realpath on both sides:
+ * node resolves import.meta.url through symlinks and junctions but leaves argv[1] as typed, so
+ * a plain comparison is false whenever the checkout is reached through a link, and the hook
+ * then silently does nothing (a guard that fails open).
+ */
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
   process.exitCode = await main();
 }
