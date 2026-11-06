@@ -55,6 +55,7 @@
       "block-uncommitted-restore.node-test.mjs",
       "block-worktree-branch-switch.mjs",
       "block-worktree-branch-switch.node-test.mjs",
+      "guard-refusal-notice.node-test.mjs",
       "hook-input.mjs",
       "hook-input.node-test.mjs",
       "inline-hatch.mjs",
