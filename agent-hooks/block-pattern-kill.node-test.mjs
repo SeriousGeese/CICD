@@ -124,10 +124,16 @@ test('the guard still blocks when its directory is reached through a symlink or 
     });
     assert.equal(r.status, 2, r.stderr);
   } finally {
+    // Remove the link itself (never what it points at); if it was never created, both fail
+    // with ENOENT, which must not mask the real error or leak the temp dir.
     try {
       unlinkSync(link);
     } catch {
-      rmdirSync(link);
+      try {
+        rmdirSync(link);
+      } catch {
+        // no link to remove
+      }
     }
     rmSync(parent, { recursive: true, force: true });
   }
