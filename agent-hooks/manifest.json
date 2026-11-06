@@ -61,8 +61,27 @@
     "worktree": [
       "agent-tooling-config.mjs",
       "agent-tooling-config.node-test.mjs",
+      "check-stale-hooks.mjs",
+      "check-stale-hooks.node-test.mjs",
+      "ensure-worktree-deps.mjs",
+      "ensure-worktree-deps.node-test.mjs",
+      "eol-fix-log.mjs",
+      "eol-fix-log.node-test.mjs",
+      "normalize-worktree-eol.mjs",
+      "normalize-worktree-eol.node-test.mjs",
+      "refresh-clean-worktree.mjs",
+      "refresh-clean-worktree.node-test.mjs",
+      "refusal-notice.mjs",
+      "refusal-notice.node-test.mjs",
       "sync.mjs",
-      "sync.node-test.mjs"
+      "sync.node-test.mjs",
+      "test-cleanup.mjs",
+      "verify-worktree-isolation.node-test.mjs",
+      "verify-worktree-isolation.sh",
+      "windows-shell-pointer.mjs",
+      "windows-shell-pointer.node-test.mjs",
+      "worktree-stale-banner.mjs",
+      "worktree-stale-banner.node-test.mjs"
     ]
   }
 }
