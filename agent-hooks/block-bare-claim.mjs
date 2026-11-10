@@ -194,10 +194,25 @@ function inlineCode(base, args) {
   return i === -1 ? null : (args[i + 1] ?? null);
 }
 
-/** True when `file` is the repository's claim helper (`claimHelper`, a repo-relative path). */
-function isClaimHelper(file, claimHelper = DEFAULTS.claimHelper) {
-  if (!claimHelper) return false;
-  return file.replace(/\\/g, '/').endsWith(`/${claimHelper}`);
+/**
+ * True when `file` (already a realpath) IS the repository's claim helper: the realpath of
+ * `claimHelper` (a repo-relative path) under the repository root `root`, compared for equality.
+ * A suffix match would let any `<anywhere>/scripts/claim.sh` pass as the approved helper, such as
+ * `/tmp/scripts/claim.sh` holding a bare claim. No root, no match; an escaping or absolute
+ * `claimHelper` (the config loader rejects both) never matches.
+ */
+function isClaimHelper(file, claimHelper = DEFAULTS.claimHelper, root, fs = DEFAULT_FS) {
+  if (!claimHelper || !root) return false;
+  const rel = String(claimHelper).replace(/\\/g, '/');
+  if (path.posix.isAbsolute(rel) || /^[A-Za-z]:/.test(rel) || rel.split('/').includes('..')) return false;
+  let expected;
+  try {
+    expected = fs.realpathSync(path.join(root, rel));
+  } catch {
+    return false;
+  }
+  const norm = (f) => (process.platform === 'win32' ? f.toLowerCase() : f).replace(/\\/g, '/');
+  return norm(file) === norm(expected);
 }
 
 /**
@@ -218,7 +233,7 @@ const DEFAULT_FS = { statSync, lstatSync, realpathSync, readFileSync };
  * claims nothing). claim.sh itself is `allowed`.
  * @returns {{ kind: 'absent' | 'allowed' } | { kind: 'text', text: string } | { kind: 'unverifiable', reason: string }}
  */
-export function classifyScript(file, fs = DEFAULT_FS, claimHelper = DEFAULTS.claimHelper) {
+export function classifyScript(file, fs = DEFAULT_FS, claimHelper = DEFAULTS.claimHelper, root = null) {
   let st;
   try {
     st = fs.statSync(file);
@@ -233,7 +248,7 @@ export function classifyScript(file, fs = DEFAULT_FS, claimHelper = DEFAULTS.cla
   }
   if (!st.isFile()) return { kind: 'absent' }; // a directory runs nothing
   try {
-    if (isClaimHelper(fs.realpathSync(file), claimHelper)) return { kind: 'allowed' };
+    if (isClaimHelper(fs.realpathSync(file), claimHelper, root, fs)) return { kind: 'allowed' };
     if (st.size > MAX_SCRIPT_BYTES) return { kind: 'unverifiable', reason: `it is over ${MAX_SCRIPT_BYTES / 1024} KB` };
     return { kind: 'text', text: fs.readFileSync(file, 'utf8') };
   } catch (e) {
@@ -304,6 +319,8 @@ export function jsClaims(text, { backticks = false } = {}) {
  * @returns {{ seg: string, kind: 'claim' | 'unverifiable', reason?: string } | null}
  */
 export function scanCommand(cmd, cwd = safeCwd(), depth = 0, fs = DEFAULT_FS, ctx = topContext()) {
+  // The repository the hook runs in, fixed at the top level: the only place the approved helper lives.
+  ctx.claimRoot ??= repoRoot(cwd) ?? path.resolve(cwd);
   // In a script's own text a whole-line comment is prose, not a command: a long script that
   // explains its claim handling in comments (worktree-new.sh does) must not count as mentioning
   // one, or an untracked/modified copy fails closed over its own documentation. The agent's own
@@ -436,7 +453,7 @@ export function scanCommand(cmd, cwd = safeCwd(), depth = 0, fs = DEFAULT_FS, ct
         return u;
       }
       const file = resolveShellDir(dir, expanded);
-      const found = classifyScript(file, fs, ctx.claimHelper);
+      const found = classifyScript(file, fs, ctx.claimHelper, ctx.claimRoot);
       // A script whose text cannot be read cannot be checked for a mention either: always closed.
       if (found.kind === 'unverifiable') return { seg: seg.raw, kind: 'unverifiable', reason: `\`${script}\`: ${found.reason}` };
       if (found.kind === 'text') {
@@ -450,7 +467,7 @@ export function scanCommand(cmd, cwd = safeCwd(), depth = 0, fs = DEFAULT_FS, ct
           // callerStrict: how strictly this script's own arguments are judged when it runs them
           // back (`"$@"`): as strictly as the level that passed them.
           const callerStrict = ctx.argv === null ? strictHere : !ctx.trusted && levelMentions;
-          const child = { vars: new Map(), argv, scriptDir: path.dirname(file), env: childEnv, trusted: isTrackedClean(file), callerStrict, claimHelper: ctx.claimHelper };
+          const child = { vars: new Map(), argv, scriptDir: path.dirname(file), env: childEnv, trusted: isTrackedClean(file), callerStrict, claimHelper: ctx.claimHelper, claimRoot: ctx.claimRoot };
           const hit = scanCommand(found.text, path.dirname(file), depth + 1, fs, child);
           if (hit) return { ...hit, seg: seg.raw };
         }

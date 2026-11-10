@@ -152,6 +152,26 @@ test('a script run by path that claims is refused; claim.sh itself and a clean s
   });
 });
 
+test('the approved helper is THIS repository\'s file, not any path ending in scripts/claim.sh', () => {
+  withDir((outside) => {
+    withDir((repo) => {
+      mkdirSync(path.join(repo, 'scripts'));
+      mkdirSync(path.join(outside, 'scripts'));
+      writeFileSync(path.join(repo, 'scripts', 'claim.sh'), 'bd update "$1" --claim\n');
+      // A lookalike OUTSIDE the repository, holding a bare claim, must be scanned like any script.
+      writeFileSync(path.join(outside, 'scripts', 'claim.sh'), 'bd update "$1" --claim\n');
+      const lookalike = path.join(outside, 'scripts', 'claim.sh').replace(/\\/g, '/');
+      assert.equal(bareClaimSegment('bash scripts/claim.sh bd-a', repo), null, 'the repository helper itself passes');
+      assert.equal(bareClaimSegment(`bash ${lookalike} bd-a`, repo) !== null, true, 'an out-of-repo lookalike is refused');
+      assert.equal(bareClaimSegment(`bash ${path.join(repo, 'scripts', 'claim.sh').replace(/\\/g, '/')} bd-a`, repo), null);
+      // A configured helper that escapes the repository never matches.
+      for (const bad of ['../x/scripts/claim.sh', '/abs/scripts/claim.sh']) {
+        assert.equal(classifyScript(path.join(outside, 'scripts', 'claim.sh'), undefined, bad, repo).kind, 'text', bad);
+      }
+    });
+  });
+});
+
 test('fail closed: an oversized script is refused as unverifiable, an ordinary clean one is allowed', () => {
   withDir((dir) => {
     writeFileSync(path.join(dir, 'big.sh'), 'echo hi\n' + '#'.repeat(MAX_SCRIPT_BYTES));
@@ -502,8 +522,9 @@ test('the configured claim helper itself is allowed; the default path no longer 
     const ctx = () => topContext(process.env, 'tools/claim.sh');
     assert.equal(scanCommand('bash tools/claim.sh bd-x', dir, 0, undefined, ctx()), null);
     assert.equal(scanCommand('bash scripts/claim.sh bd-x', dir, 0, undefined, ctx())?.kind, 'claim');
-    assert.equal(classifyScript(path.join(dir, 'tools', 'claim.sh'), undefined, 'tools/claim.sh').kind, 'allowed');
-    assert.equal(classifyScript(path.join(dir, 'tools', 'claim.sh')).kind, 'text');
+    assert.equal(classifyScript(path.join(dir, 'tools', 'claim.sh'), undefined, 'tools/claim.sh', dir).kind, 'allowed');
+    assert.equal(classifyScript(path.join(dir, 'tools', 'claim.sh'), undefined, undefined, dir).kind, 'text');
+    assert.equal(classifyScript(path.join(dir, 'tools', 'claim.sh'), undefined, 'tools/claim.sh').kind, 'text', 'no repository root, no approved helper');
   });
 });
 
