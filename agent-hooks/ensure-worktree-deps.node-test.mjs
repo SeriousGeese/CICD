@@ -14,7 +14,7 @@ import {
 import { removeTempDir } from './test-cleanup.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const hook = fileURLToPath(new URL('./ensure-worktree-deps.mjs', import.meta.url));
@@ -304,7 +304,7 @@ test('lockfile tracked but not checked out yet: the waiter claims the install pi
   try {
     const r = runHookWith(worktree, WAITER_ENV);
     assert.match(r.stdout, /checkout of this worktree is not finished/);
-    assert.ok(existsSync(pidFile), 'the install pid file --await waits on exists');
+    assert.ok(waitFor(pidFile, 5000), 'the install pid file --await waits on exists (the waiter claims it)');
     const pid = readFileSync(pidFile, 'utf8').trim();
     assert.match(pid, /^\d+$/);
     assert.ok(shellSeesAlive(pid), 'it names a LIVE process, as a shell sees it');
@@ -358,13 +358,38 @@ test('a worker that runs the install by hand while the waiter polls takes the fi
   }
 });
 
+test('the waiter claims the pid file itself: started with NO parent write at all, it still installs', () => {
+  const { root, worktree } = fixture();
+  const lock = path.join(worktree, 'package-lock.json');
+  const pidFile = path.join(worktree, '.npm-install.pid');
+  rmSync(lock);
+  let waiter;
+  try {
+    // `--wait` run directly is a waiter whose parent never wrote anything (a parent descheduled
+    // between launching and writing). When the parent owned the write, the waiter saw an absent file,
+    // stood down, and left no install.
+    waiter = spawn(process.execPath, [hook, '--wait'], {
+      cwd: worktree,
+      stdio: 'ignore',
+      env: { ...process.env, ...WAITER_ENV, AGENT_HOOKS_DEPS_WAIT_SECONDS: '30' },
+    });
+    assert.ok(waitFor(pidFile, 5000), 'the waiter wrote its own claim');
+    assert.equal(readFileSync(pidFile, 'utf8').trim(), String(waiter.pid));
+    writeFileSync(lock, '{}\n');
+    assert.ok(waitFor(path.join(worktree, '.install-called'), 10_000), 'and still installed');
+  } finally {
+    waiter?.kill();
+    cleanup(root);
+  }
+});
+
 test('a waiter gives up quietly when the lockfile never arrives, and releases its pid file', () => {
   const { root, worktree } = fixture();
   const pidFile = path.join(worktree, '.npm-install.pid');
   rmSync(path.join(worktree, 'package-lock.json'));
   try {
     runHookWith(worktree, { ...WAITER_ENV, AGENT_HOOKS_DEPS_WAIT_SECONDS: '1' });
-    assert.ok(existsSync(pidFile));
+    assert.ok(waitFor(pidFile, 5000));
     const gone = Date.now() + 10_000;
     while (existsSync(pidFile) && Date.now() < gone) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},50)']);
     assert.equal(existsSync(pidFile), false);

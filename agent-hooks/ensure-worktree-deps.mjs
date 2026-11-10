@@ -156,7 +156,7 @@ function readPid(file) {
  * still running, so the waiter is started through bash (as the install script starts its own
  * background install) and the pid is bash's `$!`. Elsewhere the child's own pid is that pid.
  */
-function launchWaiter(top) {
+function launchWaiter(top, pidFile) {
   const script = fileURLToPath(import.meta.url);
   if (process.platform === 'win32') {
     try {
@@ -164,14 +164,22 @@ function launchWaiter(top) {
         'bash',
         [
           '-c',
-          // `exec` keeps the shell's pid, so the waiter's token ($$ exported before the exec) is
-          // the same pid `$!` reports here and `kill -0` sees.
-          'nohup bash -c \'export AGENT_HOOKS_DEPS_WAITER_PID=$$; exec "$0" "$@"\' "$0" "$@" >/dev/null 2>&1 </dev/null & echo $!',
+          // The waiter's shell CLAIMS the pid file itself, before anything else runs and with
+          // noclobber so an existing file (an install, another waiter) wins: the claim can never
+          // lag behind the process it names, whatever the parent's scheduling. `exec` keeps the
+          // shell's pid, so the token ($$) is the pid `$!` reports and `kill -0` sees.
+          'nohup bash -c \'export AGENT_HOOKS_DEPS_WAITER_PID=$$; set -C; echo $$ > "$AGENT_HOOKS_DEPS_PIDFILE" || exit 0; set +C; exec "$0" "$@"\' "$0" "$@" >/dev/null 2>&1 </dev/null & echo $!',
           process.execPath,
           script,
           '--wait',
         ],
-        { cwd: top, encoding: 'utf8', timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
+        {
+          cwd: top,
+          encoding: 'utf8',
+          timeout: GIT_TIMEOUT_MS,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          env: { ...process.env, AGENT_HOOKS_DEPS_PIDFILE: pidFile.replace(/\\/g, '/') },
+        },
       ).trim();
       if (/^\d+$/.test(out)) return out;
     } catch {
@@ -193,13 +201,9 @@ function launchWaiter(top) {
 function startWaiter(top, pm, awaitCommand) {
   const pidFile = installPidFile(top, pm);
   if (existsSync(pidFile)) return;
-  const pid = launchWaiter(top);
+  // The WAITER claims the file (see launchWaiter / waitThenProvision), not this parent.
+  const pid = launchWaiter(top, pidFile);
   if (!pid) return;
-  try {
-    writeFileSync(pidFile, `${pid}\n`, { flag: 'wx' });
-  } catch {
-    /* lost the race to another claimant; the waiter finds its pid is not in the file and stands down */
-  }
   process.stdout.write(
     `[worktree-deps] The checkout of this worktree is not finished (the lockfile is tracked but missing).\n` +
       `[worktree-deps] A background waiter (pid ${pid}, recorded in ${path.basename(pidFile)}) will start the install once it lands, up to ${WAIT_SECONDS()}s.\n` +
@@ -215,7 +219,7 @@ const HANDOFF_MS = () => {
 
 /**
  * The waiter's body: poll for the lockfile, let the checkout settle, then provision exactly as
- * SessionStart would. Its token is whatever startWaiter() wrote to the install pid file; the
+ * SessionStart would. It CLAIMS the install pid file itself (token = its shell-visible pid); the
  * moment the file holds anything else (a worker ran the install by hand) it stands down.
  */
 async function waitThenProvision() {
@@ -227,7 +231,17 @@ async function waitThenProvision() {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   // This process's pid as a shell sees it (exported by the launcher), which is what the launcher
   // wrote to the pid file; process.pid when it was spawned directly.
-  const token = process.env.AGENT_HOOKS_DEPS_WAITER_PID || String(process.pid);
+  let token = process.env.AGENT_HOOKS_DEPS_WAITER_PID;
+  if (!token) {
+    // Spawned directly (no shell launcher): claim the file here, exclusively. An existing file
+    // is an install or another waiter, and wins.
+    token = String(process.pid);
+    try {
+      writeFileSync(pidFile, `${token}\n`, { flag: 'wx' });
+    } catch {
+      return;
+    }
+  }
   waiterToken = token;
   const mine = () => readPid(pidFile) === token;
   const deadline = Date.now() + WAIT_SECONDS() * 1000;
