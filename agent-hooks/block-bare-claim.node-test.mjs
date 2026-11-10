@@ -234,6 +234,30 @@ test('fail closed: nesting past MAX_DEPTH is unverifiable; within it a claim is 
   assert.equal(scanCommand(hinted)?.kind, 'unverifiable', 'past the depth cap, a mention of a claim fails closed');
 });
 
+test('an untracked script whose COMMENTS explain claiming is not refused for nesting; a real claim in it still is', () => {
+  withDir((dir) => {
+    const nested = (inner) =>
+      ['a=$(', ' b=$(', '  c=$(', '   d=$(', '    e=$(', inner, '    )', '   )', '  )', ' )', ')', ''].join('\n');
+    const comment = '     # claim.sh claims a bead; a bare bd update --claim is refused elsewhere';
+    writeFileSync(path.join(dir, 'documented.sh'), `${nested(`${comment}\n     echo hi`)}`);
+    assert.equal(scanCommand('bash documented.sh --await x', dir, 0, undefined, topContext(process.env)), null);
+    writeFileSync(path.join(dir, 'claims.sh'), `${nested(`${comment}\n     bd update bd-x --claim`)}`);
+    assert.equal(
+      scanCommand('bash claims.sh', dir, 0, undefined, topContext(process.env))?.kind,
+      'unverifiable',
+      'a real claim this deep still fails closed',
+    );
+    writeFileSync(path.join(dir, 'claims-shallow.sh'), `${comment.trim()}\nbd update bd-x --claim\n`);
+    assert.equal(scanCommand('bash claims-shallow.sh', dir, 0, undefined, topContext(process.env))?.kind, 'claim');
+  });
+});
+
+test('the agent\'s own command is never comment-stripped: a mention after # still counts', () => {
+  let hinted = 'echo hi # claim';
+  for (let i = 0; i < 6; i++) hinted = `eval ${JSON.stringify(hinted)}`;
+  assert.equal(scanCommand(hinted)?.kind, 'unverifiable');
+});
+
 test('jsClaims: an args array or an exec string claims; a test naming a claim string does not', () => {
   assert.equal(jsClaims("execFileSync('bd', ['update', id, '--claim'])"), true);
   assert.equal(jsClaims("execSync('bd update bd-x --claim')"), true);
