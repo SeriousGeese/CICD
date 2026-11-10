@@ -28,8 +28,9 @@
 // exit 0, every failure path silent or report-only. A session must never fail to
 // start because dependencies could not be installed.
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { fillTemplate, tryLoadConfig } from './agent-tooling-config.mjs';
 
 const GIT_TIMEOUT_MS = 10_000;
@@ -119,7 +120,95 @@ function argvFor(template, values) {
     .map((token) => fillTemplate(token, values));
 }
 
-function main() {
+/** True when HEAD tracks the package manager's lockfile (so its absence from the tree is a partial checkout). */
+function lockfileInHead(top, pm) {
+  try {
+    return git(['-C', top, 'ls-tree', '--name-only', 'HEAD', '--', LOCKFILES[pm]]) !== '';
+  } catch {
+    return false;
+  }
+}
+
+const WAIT_SECONDS = () => {
+  const n = Number(process.env.AGENT_HOOKS_DEPS_WAIT_SECONDS);
+  return Number.isFinite(n) && n > 0 ? n : 600;
+};
+const WAIT_POLL_MS = () => {
+  const n = Number(process.env.AGENT_HOOKS_DEPS_WAIT_POLL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 5000;
+};
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waiterPidFile(top) {
+  try {
+    const gitDir = git(['-C', top, 'rev-parse', '--absolute-git-dir']);
+    return path.join(gitDir, 'ensure-worktree-deps-waiter.pid');
+  } catch {
+    return null;
+  }
+}
+
+/** Detached, bounded poller: starts the install once the checkout delivers the lockfile. One per worktree. */
+function startWaiter(top) {
+  const pidFile = waiterPidFile(top);
+  try {
+    if (pidFile && existsSync(pidFile) && pidAlive(Number(readFileSync(pidFile, 'utf8')))) return;
+  } catch {
+    /* an unreadable pid file means no live waiter we can see: start one */
+  }
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--wait'], {
+    cwd: top,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.on('error', () => {});
+  child.unref();
+  if (pidFile && child.pid) {
+    try {
+      writeFileSync(pidFile, String(child.pid));
+    } catch {
+      /* best effort: a duplicate waiter is harmless, the install itself is guarded by its pid file */
+    }
+  }
+  process.stdout.write(
+    `[worktree-deps] The checkout of this worktree is not finished (the lockfile is tracked but missing).\n` +
+      `[worktree-deps] A background waiter will start the install once it lands (up to ${WAIT_SECONDS()}s). Do not run a gate before it does.\n`,
+  );
+}
+
+/** The waiter's body: poll for the lockfile, let the checkout settle, then provision exactly as SessionStart would. */
+async function waitThenProvision() {
+  const top = git(['rev-parse', '--show-toplevel']);
+  const { config: cfg } = tryLoadConfig({ from: top });
+  const lock = path.join(top, LOCKFILES[cfg.packageManager]);
+  const deadline = Date.now() + WAIT_SECONDS() * 1000;
+  const pidFile = waiterPidFile(top);
+  try {
+    while (!existsSync(lock) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS()));
+    }
+    if (existsSync(lock)) {
+      await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS())); // let the checkout finish writing
+      main({ waiting: true });
+    }
+  } finally {
+    try {
+      if (pidFile) rmSync(pidFile, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+function main({ waiting = false } = {}) {
   let top;
   try {
     top = git(['rev-parse', '--show-toplevel']);
@@ -137,7 +226,14 @@ function main() {
   // touching it is explicitly out of scope.
   if (!existsSync(path.join(top, '.git')) || !isFile(path.join(top, '.git'))) return;
 
-  if (!existsSync(path.join(top, LOCKFILES[pm]))) return;
+  if (!existsSync(path.join(top, LOCKFILES[pm]))) {
+    // A lockfile that HEAD tracks but the tree does not have yet is a checkout still in
+    // progress (the desktop app finishes a start_session worktree's full checkout in the
+    // background, and SessionStart can fire first), not a repo without an install. Staying
+    // silent here left such a worktree with no node_modules and nothing running. Wait for it.
+    if (!waiting && lockfileInHead(top, pm)) startWaiter(top);
+    return;
+  }
   if (!depsStale(top, pm)) return;
 
   // An install already running (e.g. the worktree script backgrounded one seconds
@@ -187,6 +283,16 @@ function isFile(p) {
   } catch {
     return false;
   }
+}
+
+if (process.argv.includes('--wait')) {
+  // The detached waiter started by startWaiter(): bounded, silent, always exits 0.
+  try {
+    await waitThenProvision();
+  } catch {
+    // Fail open, always.
+  }
+  process.exit(0);
 }
 
 try {

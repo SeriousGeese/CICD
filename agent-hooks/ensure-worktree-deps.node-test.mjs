@@ -280,6 +280,42 @@ test('no package-lock.json — nothing to npm ci, stay silent', () => {
   }
 });
 
+test('a lockfile HEAD tracks but the tree lacks yet (checkout in progress): a bounded waiter installs once it lands', () => {
+  const { root, worktree } = fixture();
+  const lock = path.join(worktree, 'package-lock.json');
+  rmSync(lock);
+  try {
+    const r = spawnSync(process.execPath, [hook], {
+      cwd: worktree,
+      encoding: 'utf8',
+      env: { ...process.env, AGENT_HOOKS_DEPS_WAIT_POLL_MS: '100', AGENT_HOOKS_DEPS_WAIT_SECONDS: '30' },
+    });
+    assert.match(r.stdout, /checkout of this worktree is not finished/);
+    assert.equal(existsSync(path.join(worktree, '.install-called')), false, 'nothing to install yet');
+    writeFileSync(lock, '{}\n'); // the checkout delivers the file
+    assert.ok(waitFor(path.join(worktree, '.install-called'), 10_000), 'the waiter started the install');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('a waiter gives up quietly when the lockfile never arrives', () => {
+  const { root, worktree } = fixture();
+  rmSync(path.join(worktree, 'package-lock.json'));
+  try {
+    const r = spawnSync(process.execPath, [hook, '--wait'], {
+      cwd: worktree,
+      encoding: 'utf8',
+      env: { ...process.env, AGENT_HOOKS_DEPS_WAIT_POLL_MS: '50', AGENT_HOOKS_DEPS_WAIT_SECONDS: '1' },
+    });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout.trim(), '');
+    assert.equal(existsSync(path.join(worktree, '.install-called')), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
 test('outside a git repo — silent, exit 0', () => {
   const root = mkdtempSync(path.join(tmpdir(), 'agent-hooks-not-a-repo-'));
   try {
