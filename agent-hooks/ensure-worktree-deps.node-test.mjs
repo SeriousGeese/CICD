@@ -280,36 +280,94 @@ test('no package-lock.json — nothing to npm ci, stay silent', () => {
   }
 });
 
-test('a lockfile HEAD tracks but the tree lacks yet (checkout in progress): a bounded waiter installs once it lands', () => {
+// A pid a SHELL sees as alive: the same `kill -0` that `worktree-new.sh --await` loops on (a Node
+// pid is not visible to Git Bash's kill on Windows, which is why the waiter is launched via bash).
+function shellSeesAlive(pid) {
+  return spawnSync('bash', ['-c', `kill -0 ${pid}`]).status === 0;
+}
+
+const WAITER_ENV = {
+  AGENT_HOOKS_DEPS_WAIT_POLL_MS: '100',
+  AGENT_HOOKS_DEPS_WAIT_SECONDS: '30',
+  AGENT_HOOKS_DEPS_HANDOFF_MS: '600',
+};
+
+function runHookWith(cwd, env) {
+  return spawnSync(process.execPath, [hook], { cwd, encoding: 'utf8', env: { ...process.env, ...env } });
+}
+
+test('lockfile tracked but not checked out yet: the waiter claims the install pid file, installs once it lands, then releases it', () => {
   const { root, worktree } = fixture();
   const lock = path.join(worktree, 'package-lock.json');
+  const pidFile = path.join(worktree, '.npm-install.pid');
   rmSync(lock);
   try {
-    const r = spawnSync(process.execPath, [hook], {
-      cwd: worktree,
-      encoding: 'utf8',
-      env: { ...process.env, AGENT_HOOKS_DEPS_WAIT_POLL_MS: '100', AGENT_HOOKS_DEPS_WAIT_SECONDS: '30' },
-    });
+    const r = runHookWith(worktree, WAITER_ENV);
     assert.match(r.stdout, /checkout of this worktree is not finished/);
+    assert.ok(existsSync(pidFile), 'the install pid file --await waits on exists');
+    const pid = readFileSync(pidFile, 'utf8').trim();
+    assert.match(pid, /^\d+$/);
+    assert.ok(shellSeesAlive(pid), 'it names a LIVE process, as a shell sees it');
     assert.equal(existsSync(path.join(worktree, '.install-called')), false, 'nothing to install yet');
     writeFileSync(lock, '{}\n'); // the checkout delivers the file
     assert.ok(waitFor(path.join(worktree, '.install-called'), 10_000), 'the waiter started the install');
+    // The stub install never rewrites the file, so the waiter still holds it and removes it itself.
+    const gone = Date.now() + 10_000;
+    while (existsSync(pidFile) && Date.now() < gone) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},50)']);
+    assert.equal(existsSync(pidFile), false, 'the waiter removes the file only because it still held its own pid');
   } finally {
     cleanup(root);
   }
 });
 
-test('a waiter gives up quietly when the lockfile never arrives', () => {
+test('the install replaces the waiter pid; the waiter then leaves the file alone', () => {
   const { root, worktree } = fixture();
+  const lock = path.join(worktree, 'package-lock.json');
+  const pidFile = path.join(worktree, '.npm-install.pid');
+  rmSync(lock);
+  // A stand-in install that does what worktree-new.sh does: record its own pid in that file.
+  writeFileSync(
+    path.join(worktree, 'scripts', 'worktree-new.sh'),
+    '#!/usr/bin/env bash\nprintf "424242\\n" > "$(dirname "$0")/../.npm-install.pid"\nprintf "%s\\n" "$@" > "$(dirname "$0")/../.install-called"\n',
+  );
+  try {
+    runHookWith(worktree, WAITER_ENV);
+    writeFileSync(lock, '{}\n');
+    assert.ok(waitFor(path.join(worktree, '.install-called'), 10_000));
+    spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},1500)']); // past the waiter's handoff window
+    assert.equal(readFileSync(pidFile, 'utf8').trim(), '424242', "the install's pid file is never removed by the waiter");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('a worker that runs the install by hand while the waiter polls takes the file; the waiter stands down', () => {
+  const { root, worktree } = fixture();
+  const lock = path.join(worktree, 'package-lock.json');
+  const pidFile = path.join(worktree, '.npm-install.pid');
+  rmSync(lock);
+  try {
+    runHookWith(worktree, WAITER_ENV);
+    writeFileSync(pidFile, '777777\n'); // the manual install's pid
+    writeFileSync(lock, '{}\n');
+    spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},1500)']);
+    assert.equal(existsSync(path.join(worktree, '.install-called')), false, 'the waiter did not start a second install');
+    assert.equal(readFileSync(pidFile, 'utf8').trim(), '777777');
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('a waiter gives up quietly when the lockfile never arrives, and releases its pid file', () => {
+  const { root, worktree } = fixture();
+  const pidFile = path.join(worktree, '.npm-install.pid');
   rmSync(path.join(worktree, 'package-lock.json'));
   try {
-    const r = spawnSync(process.execPath, [hook, '--wait'], {
-      cwd: worktree,
-      encoding: 'utf8',
-      env: { ...process.env, AGENT_HOOKS_DEPS_WAIT_POLL_MS: '50', AGENT_HOOKS_DEPS_WAIT_SECONDS: '1' },
-    });
-    assert.equal(r.status, 0);
-    assert.equal(r.stdout.trim(), '');
+    runHookWith(worktree, { ...WAITER_ENV, AGENT_HOOKS_DEPS_WAIT_SECONDS: '1' });
+    assert.ok(existsSync(pidFile));
+    const gone = Date.now() + 10_000;
+    while (existsSync(pidFile) && Date.now() < gone) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},50)']);
+    assert.equal(existsSync(pidFile), false);
     assert.equal(existsSync(path.join(worktree, '.install-called')), false);
   } finally {
     cleanup(root);
