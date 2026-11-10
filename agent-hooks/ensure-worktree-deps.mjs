@@ -28,8 +28,9 @@
 // exit 0, every failure path silent or report-only. A session must never fail to
 // start because dependencies could not be installed.
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { fillTemplate, tryLoadConfig } from './agent-tooling-config.mjs';
 
 const GIT_TIMEOUT_MS = 10_000;
@@ -119,7 +120,138 @@ function argvFor(template, values) {
     .map((token) => fillTemplate(token, values));
 }
 
-function main() {
+/** True when HEAD tracks the package manager's lockfile (so its absence from the tree is a partial checkout). */
+function lockfileInHead(top, pm) {
+  try {
+    return git(['-C', top, 'ls-tree', '--name-only', 'HEAD', '--', LOCKFILES[pm]]) !== '';
+  } catch {
+    return false;
+  }
+}
+
+const WAIT_SECONDS = () => {
+  const n = Number(process.env.AGENT_HOOKS_DEPS_WAIT_SECONDS);
+  return Number.isFinite(n) && n > 0 ? n : 600;
+};
+const WAIT_POLL_MS = () => {
+  const n = Number(process.env.AGENT_HOOKS_DEPS_WAIT_POLL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 5000;
+};
+
+function installPidFile(top, pm) {
+  return path.join(top, `.${pm}-install.pid`);
+}
+
+function readPid(file) {
+  try {
+    return readFileSync(file, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Launch the waiter and return the pid a SHELL can see. On Windows a Node pid is invisible to
+ * Git Bash's `kill -0`, which is exactly how `worktree-new.sh --await` decides an install is
+ * still running, so the waiter is started through bash (as the install script starts its own
+ * background install) and the pid is bash's `$!`. Elsewhere the child's own pid is that pid.
+ */
+function launchWaiter(top) {
+  const script = fileURLToPath(import.meta.url);
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync(
+        'bash',
+        [
+          '-c',
+          // `exec` keeps the shell's pid, so the waiter's token ($$ exported before the exec) is
+          // the same pid `$!` reports here and `kill -0` sees.
+          'nohup bash -c \'export AGENT_HOOKS_DEPS_WAITER_PID=$$; exec "$0" "$@"\' "$0" "$@" >/dev/null 2>&1 </dev/null & echo $!',
+          process.execPath,
+          script,
+          '--wait',
+        ],
+        { cwd: top, encoding: 'utf8', timeout: GIT_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'ignore'] },
+      ).trim();
+      if (/^\d+$/.test(out)) return out;
+    } catch {
+      /* no usable bash: fall through to a plain spawn */
+    }
+  }
+  const child = spawn(process.execPath, [script, '--wait'], { cwd: top, detached: true, stdio: 'ignore' });
+  child.on('error', () => {});
+  child.unref();
+  return child.pid ? String(child.pid) : null;
+}
+
+/**
+ * Detached, bounded poller: starts the install once the checkout delivers the lockfile.
+ * It CLAIMS the install pid file `--await` already waits on, so a worker's `--await` heartbeats on
+ * the waiter instead of reporting "no install recorded" (and running its own install). A pid file
+ * that already exists means an install or a waiter is already here: nothing to start.
+ */
+function startWaiter(top, pm, awaitCommand) {
+  const pidFile = installPidFile(top, pm);
+  if (existsSync(pidFile)) return;
+  const pid = launchWaiter(top);
+  if (!pid) return;
+  try {
+    writeFileSync(pidFile, `${pid}\n`, { flag: 'wx' });
+  } catch {
+    /* lost the race to another claimant; the waiter finds its pid is not in the file and stands down */
+  }
+  process.stdout.write(
+    `[worktree-deps] The checkout of this worktree is not finished (the lockfile is tracked but missing).\n` +
+      `[worktree-deps] A background waiter (pid ${pid}, recorded in ${path.basename(pidFile)}) will start the install once it lands, up to ${WAIT_SECONDS()}s.\n` +
+      `[worktree-deps] Wait for it before any gate:\n[worktree-deps]   ${awaitCommand}\n`,
+  );
+}
+
+let waiterToken = null;
+const HANDOFF_MS = () => {
+  const n = Number(process.env.AGENT_HOOKS_DEPS_HANDOFF_MS);
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
+};
+
+/**
+ * The waiter's body: poll for the lockfile, let the checkout settle, then provision exactly as
+ * SessionStart would. Its token is whatever startWaiter() wrote to the install pid file; the
+ * moment the file holds anything else (a worker ran the install by hand) it stands down.
+ */
+async function waitThenProvision() {
+  const top = git(['rev-parse', '--show-toplevel']);
+  const { config: cfg } = tryLoadConfig({ from: top });
+  const pm = cfg.packageManager;
+  const lock = path.join(top, LOCKFILES[pm]);
+  const pidFile = installPidFile(top, pm);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // This process's pid as a shell sees it (exported by the launcher), which is what the launcher
+  // wrote to the pid file; process.pid when it was spawned directly.
+  const token = process.env.AGENT_HOOKS_DEPS_WAITER_PID || String(process.pid);
+  waiterToken = token;
+  const mine = () => readPid(pidFile) === token;
+  const deadline = Date.now() + WAIT_SECONDS() * 1000;
+  try {
+    while (!existsSync(lock) && Date.now() < deadline && mine()) await sleep(WAIT_POLL_MS());
+    if (!mine() || !existsSync(lock)) return;
+    await sleep(WAIT_POLL_MS()); // let the checkout finish writing
+    if (!mine()) return;
+    main({ waiting: true });
+    // The install script replaces the file with the install's own pid; until it does, the file
+    // still names this live waiter, never a dead pid. Hold on, bounded, so that stays true.
+    const handoffUntil = Date.now() + HANDOFF_MS();
+    while (mine() && Date.now() < handoffUntil) await sleep(100);
+  } finally {
+    // Remove the file only if it still holds the waiter's own token.
+    try {
+      if (mine()) rmSync(pidFile, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+function main({ waiting = false } = {}) {
   let top;
   try {
     top = git(['rev-parse', '--show-toplevel']);
@@ -137,13 +269,22 @@ function main() {
   // touching it is explicitly out of scope.
   if (!existsSync(path.join(top, '.git')) || !isFile(path.join(top, '.git'))) return;
 
-  if (!existsSync(path.join(top, LOCKFILES[pm]))) return;
+  if (!existsSync(path.join(top, LOCKFILES[pm]))) {
+    // A lockfile that HEAD tracks but the tree does not have yet is a checkout still in
+    // progress (the desktop app finishes a start_session worktree's full checkout in the
+    // background, and SessionStart can fire first), not a repo without an install. Staying
+    // silent here left such a worktree with no node_modules and nothing running. Wait for it.
+    if (!waiting && lockfileInHead(top, pm)) startWaiter(top, pm, awaitCommand);
+    return;
+  }
   if (!depsStale(top, pm)) return;
 
   // An install already running (e.g. the worktree script backgrounded one seconds
   // ago) must not be duplicated: two concurrent installs on one tree corrupt
   // node_modules.
-  if (existsSync(path.join(top, `.${pm}-install.pid`))) {
+  const heldPid = readPid(installPidFile(top, pm));
+  // The waiter's own token in that file is its claim, not another install: proceed and hand the file over.
+  if (heldPid !== null && !(waiting && heldPid === waiterToken)) {
     process.stdout.write(`[worktree-deps] An install is already running here, wait for it before any gate:\n[worktree-deps]   ${awaitCommand}\n`);
     return;
   }
@@ -187,6 +328,16 @@ function isFile(p) {
   } catch {
     return false;
   }
+}
+
+if (process.argv.includes('--wait')) {
+  // The detached waiter started by startWaiter(): bounded, silent, always exits 0.
+  try {
+    await waitThenProvision();
+  } catch {
+    // Fail open, always.
+  }
+  process.exit(0);
 }
 
 try {
