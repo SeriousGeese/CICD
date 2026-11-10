@@ -159,6 +159,11 @@ function readSubstitution(s, i) {
   return null;
 }
 
+/** Drop whole-line shell comments (`# ...`); inline trailing comments are left alone. */
+function stripCommentLines(text) {
+  return String(text).replace(/^[ \t]*#.*$/gm, '');
+}
+
 /** Heredoc bodies are data: drop them before scanning. */
 function stripHeredocBodies(text) {
   return String(text).replace(/<<-?\s*['"]?(\w+)['"]?[^\n]*\n[\s\S]*?\n\s*\1\s*(?:\n|$)/g, '\n');
@@ -299,7 +304,11 @@ export function jsClaims(text, { backticks = false } = {}) {
  * @returns {{ seg: string, kind: 'claim' | 'unverifiable', reason?: string } | null}
  */
 export function scanCommand(cmd, cwd = safeCwd(), depth = 0, fs = DEFAULT_FS, ctx = topContext()) {
-  const levelMentions = mentionsClaim(cmd);
+  // In a script's own text a whole-line comment is prose, not a command: a long script that
+  // explains its claim handling in comments (worktree-new.sh does) must not count as mentioning
+  // one, or an untracked/modified copy fails closed over its own documentation. The agent's own
+  // command (argv === null) is never comment-stripped.
+  const levelMentions = mentionsClaim(ctx.argv === null ? cmd : stripCommentLines(cmd));
   if (depth > MAX_DEPTH) {
     // Same scope as `unverifiable` below; a tracked, unmodified script is reviewed text.
     const refuse = ctx.argv === null ? ctx.strict || levelMentions : !ctx.trusted && levelMentions;
