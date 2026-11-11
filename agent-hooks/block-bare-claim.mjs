@@ -203,7 +203,7 @@ function inlineCode(base, args) {
  *
  * The helper of ANOTHER CHECKOUT OF THE SAME REPOSITORY also matches: `root` is fixed from the
  * hook's own cwd, and a harness may run the hook from the primary checkout while the command
- * does `cd <linked worktree> && bash scripts/claim.sh ...` (DnD-llzk6). That worktree's helper
+ * does `cd <linked worktree> && bash scripts/claim.sh ...`. That worktree's helper
  * is this repository's file at another checkout, so it is compared against the helper path
  * under the worktree root that holds `file`, but only when that root shares `root`'s git common
  * directory. A checkout of any other repository, or a directory in none, still never matches.

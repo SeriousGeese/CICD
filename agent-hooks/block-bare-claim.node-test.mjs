@@ -172,7 +172,7 @@ test('the approved helper is THIS repository\'s file, not any path ending in scr
   });
 });
 
-test('the helper of a linked worktree of THIS repository passes from the primary checkout (DnD-llzk6)', () => {
+test('the helper of a linked worktree of THIS repository passes from the primary checkout', () => {
   // A helper that computes its own interpreter path (`NODE_SCRIPT_DIR="$(to_node_path ...)"`) is
   // unresolvable to a scan, so it must be recognised as the helper, never read as a script.
   const helper = 'SCRIPT_DIR=x\nNODE_SCRIPT_DIR="$(to_node_path "$SCRIPT_DIR")"\nnode "$NODE_SCRIPT_DIR/claim-age.mjs" "$1"\nbd update "$1" --claim\n';
