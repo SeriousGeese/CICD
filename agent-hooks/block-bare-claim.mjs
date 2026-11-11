@@ -207,6 +207,8 @@ function inlineCode(base, args) {
  * is this repository's file at another checkout, so it is compared against the helper path
  * under the worktree root that holds `file`, but only when that root shares `root`'s git common
  * directory. A checkout of any other repository, or a directory in none, still never matches.
+ * Like the helper in the hook's own checkout, it is trusted by identity, not scanned: any
+ * registered worktree's copy is approved as it stands, branch edits included.
  */
 function isClaimHelper(file, claimHelper = DEFAULTS.claimHelper, root, fs = DEFAULT_FS) {
   if (!claimHelper || !root) return false;
@@ -231,24 +233,28 @@ function isClaimHelper(file, claimHelper = DEFAULTS.claimHelper, root, fs = DEFA
  * The git common directory of the checkout at `root`, normalized, or null. A primary checkout's
  * `.git` is that directory; a linked worktree's `.git` is a file naming its private git dir,
  * whose `commondir` file points back at the shared one. Read from the files, never by running git.
+ *
+ * A `.git` FILE is only believed when git's own registration agrees: its private dir must be
+ * `<common>/worktrees/<name>`, and that dir's `gitdir` back-pointer must name this `.git` file.
+ * Otherwise any directory could claim the repository with one line (`gitdir: <repo>/.git`) and
+ * have its own `scripts/claim.sh` approved without a scan.
  */
 function gitCommonDir(root, fs = DEFAULT_FS) {
   const dotGit = path.join(root, '.git');
+  const norm = (f) => (process.platform === 'win32' ? f.toLowerCase() : f).replace(/\\/g, '/');
   try {
-    let gitDir = dotGit;
-    if (fs.statSync(dotGit).isFile()) {
-      const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
-      if (!m) return null;
-      gitDir = path.resolve(root, m[1]);
-    }
-    let common = gitDir;
-    try {
-      common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
-    } catch (e) {
-      if (e?.code !== 'ENOENT') return null;
-    }
-    const real = fs.realpathSync(common);
-    return (process.platform === 'win32' ? real.toLowerCase() : real).replace(/\\/g, '/');
+    if (!fs.statSync(dotGit).isFile()) return norm(fs.realpathSync(dotGit));
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
+    if (!m) return null;
+    const gitDir = path.resolve(root, m[1]);
+    const common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
+    const realCommon = fs.realpathSync(common);
+    // The private dir must be a registered worktree of that common dir ...
+    if (norm(fs.realpathSync(path.dirname(gitDir))) !== norm(path.join(realCommon, 'worktrees'))) return null;
+    // ... whose back-pointer (absolute, or relative to the private dir) names this checkout.
+    const back = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'gitdir'), 'utf8').trim());
+    if (norm(fs.realpathSync(back)) !== norm(fs.realpathSync(dotGit))) return null;
+    return norm(realCommon);
   } catch {
     return null;
   }

@@ -184,8 +184,9 @@ test('the helper of a linked worktree of THIS repository passes from the primary
         writeFileSync(path.join(primary, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
         mkdirSync(path.join(primary, 'scripts'));
         writeFileSync(path.join(primary, 'scripts', 'claim.sh'), helper);
-        // wt: a linked worktree of primary, as `git worktree add` lays it out.
+        // wt: a linked worktree of primary, as `git worktree add` lays it out, back-pointer included.
         writeFileSync(path.join(wt, '.git'), `gitdir: ${path.join(primary, '.git', 'worktrees', 'wt')}\n`);
+        writeFileSync(path.join(primary, '.git', 'worktrees', 'wt', 'gitdir'), `${path.join(wt, '.git')}\n`);
         mkdirSync(path.join(wt, 'scripts'));
         writeFileSync(path.join(wt, 'scripts', 'claim.sh'), helper);
         // other: a different repository with a lookalike helper.
@@ -205,8 +206,37 @@ test('the helper of a linked worktree of THIS repository passes from the primary
         assert.notEqual(bareClaimSegment(viaOther, primary), null, 'another repository\'s lookalike is still scanned');
         assert.equal(runHook(viaOther, {}, primary).status, 2);
         assert.equal(classifyScript(path.join(other, 'scripts', 'claim.sh'), undefined, 'scripts/claim.sh', primary).kind, 'text');
+
+        // A forged `.git` FILE claiming the repository is not a registered worktree: still scanned.
+        for (const forged of [path.join(primary, '.git'), path.join(primary, '.git', 'worktrees', 'wt')]) {
+          const fake = path.join(other, 'fake');
+          mkdirSync(path.join(fake, 'scripts'), { recursive: true });
+          writeFileSync(path.join(fake, '.git'), `gitdir: ${forged}\n`);
+          writeFileSync(path.join(fake, 'scripts', 'claim.sh'), helper);
+          assert.equal(classifyScript(path.join(fake, 'scripts', 'claim.sh'), undefined, 'scripts/claim.sh', primary).kind, 'text', forged);
+          assert.equal(runHook(`cd ${fwd(fake)} && bash scripts/claim.sh bd-x --claim-only`, {}, primary).status, 2, forged);
+        }
       });
     });
+  });
+});
+
+test('a linked worktree registered with RELATIVE paths (worktree.useRelativePaths) is recognised too', () => {
+  const helper = 'NODE_SCRIPT_DIR="$(to_node_path "$SCRIPT_DIR")"\nnode "$NODE_SCRIPT_DIR/claim-age.mjs" "$1"\n';
+  withDir((base) => {
+    const primary = path.join(base, 'prim');
+    const wt = path.join(base, 'wt');
+    mkdirSync(path.join(primary, '.git', 'worktrees', 'wt'), { recursive: true });
+    mkdirSync(path.join(primary, 'scripts'));
+    mkdirSync(path.join(wt, 'scripts'), { recursive: true });
+    writeFileSync(path.join(primary, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+    // Both pointers relative: the .git file to its own dir, the back-pointer to the private dir.
+    writeFileSync(path.join(wt, '.git'), 'gitdir: ../prim/.git/worktrees/wt\n');
+    writeFileSync(path.join(primary, '.git', 'worktrees', 'wt', 'gitdir'), '../../../../wt/.git\n');
+    writeFileSync(path.join(primary, 'scripts', 'claim.sh'), helper);
+    writeFileSync(path.join(wt, 'scripts', 'claim.sh'), helper);
+    assert.equal(classifyScript(path.join(wt, 'scripts', 'claim.sh'), undefined, 'scripts/claim.sh', primary).kind, 'allowed');
+    assert.equal(runHook(`cd ${wt.replace(/\\/g, '/')} && bash scripts/claim.sh bd-x --claim-only`, {}, primary).status, 0);
   });
 });
 
