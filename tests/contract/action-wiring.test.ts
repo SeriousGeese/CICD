@@ -90,6 +90,15 @@ describe('composite actions', () => {
     });
   }
 
+  it('resolve-gh always hands its probe a token', () => {
+    // engine/resolve-gh.sh makes its API probe only when GH_TOKEN is set, and
+    // that probe is what catches a gh that passes --version but crashes on its
+    // first network call (artemis, 2026-11-11). If the action stops exporting a
+    // token, the probe silently turns off and the broken gh is accepted again.
+    const yml = readFileSync(path.join(actionsDir, 'resolve-gh', 'action.yml'), 'utf8');
+    expect(yml).toMatch(/^\s+GH_TOKEN: \$\{\{ inputs\.github-token \|\| github\.token \}\}\s*$/m);
+  });
+
   it('at least one action actually runs the engine', () => {
     // The per-action check above tolerates an action that runs nothing from
     // engine/. This makes sure every action still does, which would otherwise

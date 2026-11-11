@@ -12,7 +12,8 @@
 # __pointer_chk_guard"). The old resolver accepted it because it was executable,
 # logged "Resolved", and every review on that runner then held its PR. A
 # candidate now counts only if `gh --version` exits 0 and its stdout says
-# "gh version".
+# "gh version", AND (when a token is present) one real API call succeeds:
+# `--version` alone passed on artemis while every API call crashed (see probe).
 #
 # Why a pinned download: when no installed gh runs (the case above), use the
 # official release tarball. Those binaries are static Go builds, so they do not
@@ -36,7 +37,7 @@ GH_PINNED_VERSION="2.103.3"
 # From https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_checksums.txt
 GH_SHA256_LINUX_AMD64="4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d"
 GH_SHA256_LINUX_ARM64="ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63"
-PROBE_TIMEOUT_SECONDS=10
+PROBE_TIMEOUT_SECONDS=20
 
 : "${GITHUB_ENV:?GITHUB_ENV must be set (this runs inside a GitHub Actions step)}"
 runner_name="${RUNNER_NAME:-unknown-runner}"
@@ -77,10 +78,42 @@ probe() {
     return 1
   fi
   case "$first" in
-    "gh version "*) probe_version="$first"; return 0 ;;
+    "gh version "*) ;;
+    *)
+      failures+=("$1: --version did not identify gh: ${first:-${err:-<no output>}}")
+      return 1
+      ;;
   esac
-  failures+=("$1: --version did not identify gh: ${first:-${err:-<no output>}}")
-  return 1
+  probe_version="$first"
+
+  # `--version` is not enough. On artemis (2026-11-11) the linuxbrew gh passed
+  # it and then died on its first API call: resolving a hostname makes glibc
+  # dlopen the HOST's NSS modules (/run/host/usr/lib64), which need a
+  # GLIBC_PRIVATE symbol the brew glibc lacks ("undefined symbol:
+  # __pointer_chk_guard"). With lazy binding nothing fails until that call. So
+  # make one real call when a token is present (the action passes
+  # github.token by default; gh refuses to touch the network without one).
+  # GET /rate_limit does not count against the rate limit.
+  #
+  # Only a CRASH condemns the binary: exec failure (126/127), a signal (>=128),
+  # a timeout (124), or a dynamic-loader message. A gh that ran and got an
+  # HTTP error back (bad token, 5xx) WORKS: the API said no, and pr-review will
+  # fail on that itself with the real cause instead of "install gh".
+  if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+    rc=0
+    with_timeout "$1" api rate_limit --jq .resources.core.limit >/dev/null 2>"$scratch/probe.err" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      err="$(head -1 "$scratch/probe.err" 2>/dev/null || true)"
+      if [ "$rc" -eq 124 ] || [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ] || [ "$rc" -ge 128 ] ||
+        grep -Eq 'symbol lookup error|error while loading shared libraries|cannot execute' "$scratch/probe.err" 2>/dev/null; then
+        [ "$rc" -eq 124 ] && err="timed out after ${PROBE_TIMEOUT_SECONDS}s"
+        failures+=("$1: runs, but crashed on an API call (rc=$rc): ${err:-<no output>}")
+        return 1
+      fi
+      echo "Note: $1 works, but its probe API call was refused (rc=$rc): ${err:-<no output>}"
+    fi
+  fi
+  return 0
 }
 
 accept() {

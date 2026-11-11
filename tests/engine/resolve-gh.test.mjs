@@ -24,6 +24,7 @@ let dir;
 let working;
 let broken;
 let impostor;
+let lazyCrash;
 let notExecutable;
 
 function stub(name, body) {
@@ -41,6 +42,16 @@ beforeAll(() => {
     'echo "/home/linuxbrew/.linuxbrew/bin/gh: symbol lookup error: /run/host/usr/lib64/libc.so.6: undefined symbol: __pointer_chk_guard, version GLIBC_PRIVATE" >&2; exit 127',
   );
   impostor = stub('gh-impostor', 'echo "hello from something else"');
+  // The artemis shape: --version works, the first API call dies (lazy binding,
+  // host NSS modules against brew glibc).
+  lazyCrash = stub(
+    'gh-lazy-crash',
+    [
+      'if [ "$1" = "--version" ]; then echo "gh version 2.103.3 (2026-10-26)"; exit 0; fi',
+      'echo "/home/linuxbrew/.linuxbrew/bin/gh: symbol lookup error: /run/host/usr/lib64/libc.so.6: undefined symbol: __pointer_chk_guard, version GLIBC_PRIVATE" >&2',
+      'exit 127',
+    ].join('\n'),
+  );
   notExecutable = path.join(dir, 'gh-plain');
   writeFileSync(notExecutable, 'not a program', 'utf8');
 });
@@ -59,6 +70,9 @@ function run({ hint = '', candidates = [], download = false, extraEnv = {} } = {
     GH_CLI_HINT: hint ? posix(hint) : '',
     RESOLVE_GH_TEST: '1',
     RESOLVE_GH_CANDIDATES: candidates.map(posix).join('\n'),
+    // The job always has a token; make the API probe deterministic here.
+    GH_TOKEN: 'test-token',
+    GITHUB_TOKEN: '',
     ...(download ? {} : { RESOLVE_GH_NO_DOWNLOAD: '1' }),
     ...extraEnv,
   };
@@ -78,6 +92,53 @@ describe('resolve-gh.sh', () => {
     expect(r.status).toBe(0);
     expect(r.exported.GH_CLI).toBe(posix(working));
     expect(r.stdout).toContain('gh version 2.103.3');
+  });
+
+  it('skips a gh whose --version works but whose first API call crashes', () => {
+    const r = run({ candidates: [lazyCrash, working] });
+    expect(r.status).toBe(0);
+    expect(r.exported.GH_CLI).toBe(posix(working));
+  });
+
+  it('reports the API-call crash when it is the only candidate', () => {
+    const r = run({ candidates: [lazyCrash] });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('runs, but crashed on an API call (rc=127)');
+    expect(r.stdout).toContain('__pointer_chk_guard');
+  });
+
+  it('a gh that runs but gets an HTTP error back is accepted (the API said no, the binary works)', () => {
+    const refused = stub(
+      'gh-refused',
+      [
+        'if [ "$1" = "--version" ]; then echo "gh version 2.103.3 (2026-10-26)"; exit 0; fi',
+        'echo "HTTP 502: Bad Gateway (https://api.github.com/rate_limit)" >&2',
+        'exit 1',
+      ].join('\n'),
+    );
+    const r = run({ candidates: [refused, working] });
+    expect(r.status).toBe(0);
+    expect(r.exported.GH_CLI).toBe(posix(refused));
+    expect(r.stdout).toContain('probe API call was refused (rc=1): HTTP 502');
+  });
+
+  it('a loader error with a plain rc=1 still counts as a crash', () => {
+    const wrapped = stub(
+      'gh-wrapped-crash',
+      [
+        'if [ "$1" = "--version" ]; then echo "gh version 2.103.3 (2026-10-26)"; exit 0; fi',
+        'echo "gh: error while loading shared libraries: libfoo.so: cannot open shared object file" >&2',
+        'exit 1',
+      ].join('\n'),
+    );
+    const r = run({ candidates: [wrapped, working] });
+    expect(r.exported.GH_CLI).toBe(posix(working));
+  });
+
+  it('without a token, --version alone decides (no API call is possible)', () => {
+    const r = run({ candidates: [lazyCrash], extraEnv: { GH_TOKEN: '', GITHUB_TOKEN: '' } });
+    expect(r.status).toBe(0);
+    expect(r.exported.GH_CLI).toBe(posix(lazyCrash));
   });
 
   it('a broken hint is not fatal', () => {
