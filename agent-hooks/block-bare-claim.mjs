@@ -243,7 +243,12 @@ function gitCommonDir(root, fs = DEFAULT_FS) {
   const dotGit = path.join(root, '.git');
   const norm = (f) => (process.platform === 'win32' ? f.toLowerCase() : f).replace(/\\/g, '/');
   try {
-    if (!fs.statSync(dotGit).isFile()) return norm(fs.realpathSync(dotGit));
+    // lstat, never stat: a `.git` SYMLINK to the repository's `.git` would otherwise pass as the
+    // primary checkout itself. Git never creates one; a real `.git` is a directory or a file.
+    const st = fs.lstatSync(dotGit);
+    if (st.isSymbolicLink()) return null;
+    if (st.isDirectory()) return norm(fs.realpathSync(dotGit));
+    if (!st.isFile()) return null;
     const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
     if (!m) return null;
     const gitDir = path.resolve(root, m[1]);
