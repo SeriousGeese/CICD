@@ -92,14 +92,16 @@ describe('composite actions', () => {
 
   it('at least one action actually runs the engine', () => {
     // The per-action check above tolerates an action that runs nothing from
-    // engine/ (resolve-gh). This makes sure they are not ALL like that, which
-    // would mean the actions had quietly stopped invoking the shared engine.
+    // engine/. This makes sure every action still does, which would otherwise
+    // mean one had quietly stopped invoking the shared engine. resolve-gh moved
+    // its logic into engine/resolve-gh.sh so the probe and the pinned download
+    // can be tested by running them.
     const runsEngine = actions.filter((n) =>
       /ACTION_PATH\}?\/\.\.\/\.\.\/engine\//.test(
         readFileSync(path.join(actionsDir, n, 'action.yml'), 'utf8'),
       ),
     );
-    expect(runsEngine.sort()).toEqual(['ci-gate', 'pr-review']);
+    expect(runsEngine.sort()).toEqual(['ci-gate', 'pr-review', 'resolve-gh']);
   });
 
   it('pr-review reads .cicd/config.env from the BASE commit, never the PR head', () => {
