@@ -172,6 +172,44 @@ test('the approved helper is THIS repository\'s file, not any path ending in scr
   });
 });
 
+test('the helper of a linked worktree of THIS repository passes from the primary checkout (DnD-llzk6)', () => {
+  // A helper that computes its own interpreter path (`NODE_SCRIPT_DIR="$(to_node_path ...)"`) is
+  // unresolvable to a scan, so it must be recognised as the helper, never read as a script.
+  const helper = 'SCRIPT_DIR=x\nNODE_SCRIPT_DIR="$(to_node_path "$SCRIPT_DIR")"\nnode "$NODE_SCRIPT_DIR/claim-age.mjs" "$1"\nbd update "$1" --claim\n';
+  withDir((primary) => {
+    withDir((wt) => {
+      withDir((other) => {
+        // primary: a real .git directory holding the linked worktree's private git dir.
+        mkdirSync(path.join(primary, '.git', 'worktrees', 'wt'), { recursive: true });
+        writeFileSync(path.join(primary, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+        mkdirSync(path.join(primary, 'scripts'));
+        writeFileSync(path.join(primary, 'scripts', 'claim.sh'), helper);
+        // wt: a linked worktree of primary, as `git worktree add` lays it out.
+        writeFileSync(path.join(wt, '.git'), `gitdir: ${path.join(primary, '.git', 'worktrees', 'wt')}\n`);
+        mkdirSync(path.join(wt, 'scripts'));
+        writeFileSync(path.join(wt, 'scripts', 'claim.sh'), helper);
+        // other: a different repository with a lookalike helper.
+        mkdirSync(path.join(other, '.git'));
+        mkdirSync(path.join(other, 'scripts'));
+        writeFileSync(path.join(other, 'scripts', 'claim.sh'), helper);
+
+        const fwd = (p) => p.replace(/\\/g, '/');
+        const viaWt = `cd ${fwd(wt)} && bash scripts/claim.sh bd-x --claim-only`;
+        assert.equal(bareClaimSegment(viaWt, primary), null, 'the linked worktree helper passes');
+        assert.equal(runHook(viaWt, {}, primary).status, 0, 'end to end, from the primary checkout');
+        assert.equal(classifyScript(path.join(wt, 'scripts', 'claim.sh'), undefined, 'scripts/claim.sh', primary).kind, 'allowed');
+        // And the other way round: the primary's helper from inside the linked worktree.
+        assert.equal(bareClaimSegment(`cd ${fwd(primary)} && bash scripts/claim.sh bd-x --claim-only`, wt), null);
+
+        const viaOther = `cd ${fwd(other)} && bash scripts/claim.sh bd-x --claim-only`;
+        assert.notEqual(bareClaimSegment(viaOther, primary), null, 'another repository\'s lookalike is still scanned');
+        assert.equal(runHook(viaOther, {}, primary).status, 2);
+        assert.equal(classifyScript(path.join(other, 'scripts', 'claim.sh'), undefined, 'scripts/claim.sh', primary).kind, 'text');
+      });
+    });
+  });
+});
+
 test('fail closed: an oversized script is refused as unverifiable, an ordinary clean one is allowed', () => {
   withDir((dir) => {
     writeFileSync(path.join(dir, 'big.sh'), 'echo hi\n' + '#'.repeat(MAX_SCRIPT_BYTES));
