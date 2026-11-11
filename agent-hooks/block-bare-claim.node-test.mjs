@@ -221,6 +221,23 @@ test('the helper of a linked worktree of THIS repository passes from the primary
   });
 });
 
+test('a directory whose .git is a SYMLINK to the repository\'s .git is not a checkout of it', () => {
+  const helper = 'NODE_SCRIPT_DIR="$(to_node_path "$SCRIPT_DIR")"\nnode "$NODE_SCRIPT_DIR/claim-age.mjs" "$1"\nbd update "$1" --claim\n';
+  withDir((base) => {
+    const primary = path.join(base, 'prim');
+    const fake = path.join(base, 'fake');
+    mkdirSync(path.join(primary, '.git'), { recursive: true });
+    mkdirSync(path.join(primary, 'scripts'));
+    mkdirSync(path.join(fake, 'scripts'), { recursive: true });
+    writeFileSync(path.join(primary, 'scripts', 'claim.sh'), helper);
+    writeFileSync(path.join(fake, 'scripts', 'claim.sh'), helper);
+    // 'junction' needs no privilege on Windows and is ignored elsewhere (a plain dir symlink).
+    symlinkSync(path.join(primary, '.git'), path.join(fake, '.git'), 'junction');
+    assert.equal(classifyScript(path.join(fake, 'scripts', 'claim.sh'), undefined, 'scripts/claim.sh', primary).kind, 'text');
+    assert.equal(runHook(`cd ${fake.replace(/\\/g, '/')} && bash scripts/claim.sh bd-x --claim-only`, {}, primary).status, 2);
+  });
+});
+
 test('a linked worktree registered with RELATIVE paths (worktree.useRelativePaths) is recognised too', () => {
   const helper = 'NODE_SCRIPT_DIR="$(to_node_path "$SCRIPT_DIR")"\nnode "$NODE_SCRIPT_DIR/claim-age.mjs" "$1"\n';
   withDir((base) => {
