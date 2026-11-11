@@ -103,8 +103,36 @@ describe('resolve-gh.sh', () => {
   it('reports the API-call crash when it is the only candidate', () => {
     const r = run({ candidates: [lazyCrash] });
     expect(r.status).toBe(1);
-    expect(r.stdout).toContain('runs, but an API call failed (rc=127)');
+    expect(r.stdout).toContain('runs, but crashed on an API call (rc=127)');
     expect(r.stdout).toContain('__pointer_chk_guard');
+  });
+
+  it('a gh that runs but gets an HTTP error back is accepted (the API said no, the binary works)', () => {
+    const refused = stub(
+      'gh-refused',
+      [
+        'if [ "$1" = "--version" ]; then echo "gh version 2.103.3 (2026-10-26)"; exit 0; fi',
+        'echo "HTTP 502: Bad Gateway (https://api.github.com/rate_limit)" >&2',
+        'exit 1',
+      ].join('\n'),
+    );
+    const r = run({ candidates: [refused, working] });
+    expect(r.status).toBe(0);
+    expect(r.exported.GH_CLI).toBe(posix(refused));
+    expect(r.stdout).toContain('probe API call was refused (rc=1): HTTP 502');
+  });
+
+  it('a loader error with a plain rc=1 still counts as a crash', () => {
+    const wrapped = stub(
+      'gh-wrapped-crash',
+      [
+        'if [ "$1" = "--version" ]; then echo "gh version 2.103.3 (2026-10-26)"; exit 0; fi',
+        'echo "gh: error while loading shared libraries: libfoo.so: cannot open shared object file" >&2',
+        'exit 1',
+      ].join('\n'),
+    );
+    const r = run({ candidates: [wrapped, working] });
+    expect(r.exported.GH_CLI).toBe(posix(working));
   });
 
   it('without a token, --version alone decides (no API call is possible)', () => {

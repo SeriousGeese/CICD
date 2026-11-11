@@ -91,16 +91,26 @@ probe() {
   # dlopen the HOST's NSS modules (/run/host/usr/lib64), which need a
   # GLIBC_PRIVATE symbol the brew glibc lacks ("undefined symbol:
   # __pointer_chk_guard"). With lazy binding nothing fails until that call. So
-  # make one real call when a token is present. GET /rate_limit does not count
-  # against the rate limit.
+  # make one real call when a token is present (the action passes
+  # github.token by default; gh refuses to touch the network without one).
+  # GET /rate_limit does not count against the rate limit.
+  #
+  # Only a CRASH condemns the binary: exec failure (126/127), a signal (>=128),
+  # a timeout (124), or a dynamic-loader message. A gh that ran and got an
+  # HTTP error back (bad token, 5xx) WORKS: the API said no, and pr-review will
+  # fail on that itself with the real cause instead of "install gh".
   if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
     rc=0
     with_timeout "$1" api rate_limit --jq .resources.core.limit >/dev/null 2>"$scratch/probe.err" || rc=$?
     if [ "$rc" -ne 0 ]; then
       err="$(head -1 "$scratch/probe.err" 2>/dev/null || true)"
-      [ "$rc" -eq 124 ] && err="timed out after ${PROBE_TIMEOUT_SECONDS}s"
-      failures+=("$1: runs, but an API call failed (rc=$rc): ${err:-<no output>}")
-      return 1
+      if [ "$rc" -eq 124 ] || [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ] || [ "$rc" -ge 128 ] ||
+        grep -Eq 'symbol lookup error|error while loading shared libraries|cannot execute' "$scratch/probe.err" 2>/dev/null; then
+        [ "$rc" -eq 124 ] && err="timed out after ${PROBE_TIMEOUT_SECONDS}s"
+        failures+=("$1: runs, but crashed on an API call (rc=$rc): ${err:-<no output>}")
+        return 1
+      fi
+      echo "Note: $1 works, but its probe API call was refused (rc=$rc): ${err:-<no output>}"
     fi
   fi
   return 0
