@@ -1541,7 +1541,14 @@ provider_error_code() {
 # One clause naming what kind of paid-tier failure LLM_LAST_FAILURE records
 # (pcic-ndyi), so "out of credits" and "slow provider" never read alike.
 paid_failure_kind() {
+  # The provider's code wins over the status: OpenRouter can refuse for
+  # credits with a 402 status or with a 402 code inside a 200.
+  if [ "${LLM_LAST_ERROR_CODE:-}" = "402" ]; then
+    echo "paid tier refused (402 no credits)"
+    return 0
+  fi
   case "${LLM_LAST_FAILURE:-}" in
+    "HTTP 200 carrying an error"*) echo "paid tier refused (an error in a 200 response)" ;;
     "HTTP 402") echo "paid tier refused (402 no credits)" ;;
     "HTTP 401"|"HTTP 403") echo "paid tier refused (${LLM_LAST_FAILURE#HTTP }: key rejected)" ;;
     "HTTP 404") echo "paid tier refused (404 model not found)" ;;
@@ -1699,7 +1706,21 @@ sys.exit(0 if c and c.strip() else 1)
     # identically in the log (DnD-u1eog).
     log "    HTTP 200 after ${elapsed}s but the response carried NO usable message content"
     log "      body head: $(head -c 300 "$body_file" | tr '\n' ' ')"
-    LLM_LAST_FAILURE="HTTP 200 with no usable content after ${elapsed}s"
+    # Three 200s that mean different things (pcic-ndyi review): one carrying
+    # an error object (a provider can refuse with 200, e.g. no credits), one
+    # whose message content is just empty (the call worked; a reasoning model
+    # can spend a small budget thinking), and anything else unusable.
+    local shape
+    shape="$(jq -r 'if type != "object" then "other"
+      elif .error then "error"
+      elif ((.choices // []) | length) == 0 then "other"
+      elif ((.choices[0].message.content // "") | tostring) == "" then "empty"
+      else "other" end' < "$body_file" 2>/dev/null || true)"
+    case "$shape" in
+      error) LLM_LAST_FAILURE="HTTP 200 carrying an error after ${elapsed}s" ;;
+      empty) LLM_LAST_FAILURE="HTTP 200 with empty content after ${elapsed}s" ;;
+      *) LLM_LAST_FAILURE="HTTP 200 with no usable content after ${elapsed}s" ;;
+    esac
     LLM_LAST_ERROR_CODE="$(provider_error_code < "$body_file")"
     rm -f "$body_file"
     return 1

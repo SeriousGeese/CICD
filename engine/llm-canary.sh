@@ -17,8 +17,9 @@
 #        With GITHUB_OUTPUT set, also result=ok|failed|misconfigured and reason=.
 # Exit:  0 the paid tier answered, 1 it did not, 2 misconfigured (no key/model).
 #
-# A 200 whose content is empty still counts as OK: the key, the credits and the
-# model all worked, and a reasoning model can spend a small budget thinking.
+# A well-formed 200 whose message content is empty still counts as OK: the key,
+# the credits and the model all worked, and a reasoning model can spend a small
+# budget thinking. A 200 carrying an error, with no choices, or not JSON fails.
 # Cost: one request of a few dozen prompt tokens and at most CANARY_MAX_TOKENS.
 set -euo pipefail
 
@@ -26,6 +27,9 @@ CANARY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 emit() {
   local result="$1" reason="$2"
+  # GITHUB_OUTPUT is key=value per line: a line break in the reason (the model
+  # name is the consumer's variable) would start a new key.
+  reason="$(printf '%s' "$reason" | tr '\r\n' '  ')"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     { echo "result=${result}"; echo "reason=${reason}"; } >> "$GITHUB_OUTPUT" 2>/dev/null || true
   fi
@@ -54,7 +58,10 @@ call_llm "$OPENROUTER_ENDPOINT" "$OPENROUTER_MODEL" "$OPENROUTER_API_KEY" \
   "You are a health check. Answer with one word." "Reply with the single word OK." \
   false "${CANARY_MAX_TOKENS:-256}" > /dev/null || canary_rc=$?
 
-if [ "$canary_rc" -eq 0 ] || [[ "${LLM_LAST_FAILURE:-}" == "HTTP 200"* ]]; then
+# Only a well-formed answer whose content is empty counts besides a real one:
+# a 200 carrying an error object (a provider can refuse for credits that way),
+# with no choices, or that is not JSON at all is a failure.
+if [ "$canary_rc" -eq 0 ] || [[ "${LLM_LAST_FAILURE:-}" == "HTTP 200 with empty content"* ]]; then
   reason="provider openrouter, model ${OPENROUTER_MODEL} answered"
   echo "CANARY OK: ${reason}"
   emit ok "$reason"

@@ -110,11 +110,6 @@ describe('why the paid tier did not answer', () => {
     ],
     ['network failure', { PAID_RC: '6' }, 'paid tier unreachable (network error (curl 6)); provider openrouter, model paid/model, status network error (curl 6), error code none'],
     [
-      'a 200 with no content',
-      { PAID_HTTP: '200', PAID_BODY: '{"choices":[{"message":{"content":""}}]}' },
-      'paid tier answered without a usable review (HTTP 200 with no usable content after 0s); provider openrouter, model paid/model, status HTTP 200 with no usable content after 0s, error code none',
-    ],
-    [
       'an error code carrying shell and spaces',
       { PAID_HTTP: '400', PAID_BODY: '{"error":{"code":"bad request; $(id) `x`"}}' },
       'paid tier refused (HTTP 400); provider openrouter, model paid/model, status HTTP 400, error code badrequestidx',
@@ -126,6 +121,40 @@ describe('why the paid tier did not answer', () => {
     expect(recorded(out)).toBe(expected);
     expect(paidLine(out)).not.toContain(PROMPT_MARK);
     expect(out).not.toContain(KEY);
+  });
+
+  // The elapsed seconds are real time, so these match `after \d+s`.
+  it.each<[string, string, RegExp]>([
+    [
+      'a 200 with empty content',
+      '{"choices":[{"message":{"content":""}}]}',
+      /^paid tier answered without a usable review \(HTTP 200 with empty content after \d+s\); provider openrouter, model paid\/model, status HTTP 200 with empty content after \d+s, error code none$/,
+    ],
+    [
+      'a 200 carrying a 402 error object',
+      '{"error":{"code":402,"message":"Insufficient credits"}}',
+      /^paid tier refused \(402 no credits\); provider openrouter, model paid\/model, status HTTP 200 carrying an error after \d+s, error code 402$/,
+    ],
+    [
+      'a 200 carrying another error',
+      '{"error":{"code":"server_overloaded"}}',
+      /^paid tier refused \(an error in a 200 response\); provider openrouter, model paid\/model, status HTTP 200 carrying an error after \d+s, error code server_overloaded$/,
+    ],
+    [
+      'a 200 with no choices',
+      '{"choices":[]}',
+      /^paid tier answered without a usable review \(HTTP 200 with no usable content after \d+s\);.* error code none$/,
+    ],
+    ['a 200 that is not JSON', '<html>ok</html>', /^paid tier answered without a usable review \(HTTP 200 with no usable content after \d+s\);/],
+  ])('%s', (_name, body, expected) => {
+    const out = review({ PAID_HTTP: '200', PAID_BODY: body });
+    expect(out).toContain('rc=0 tier=openrouter-free');
+    expect(recorded(out)).toMatch(expected);
+  });
+
+  it('caps the provider error code at 40 characters', () => {
+    const out = review({ PAID_HTTP: '400', PAID_BODY: `{"error":{"code":"${'a'.repeat(60)}"}}` });
+    expect(recorded(out)).toMatch(new RegExp(`error code ${'a'.repeat(40)}$`));
   });
 
   it('words a timeout apart from a refusal', () => {
@@ -205,9 +234,28 @@ describe('engine/llm-canary.sh', { timeout: 120_000 }, () => {
     expect(r.output).toContain('result=ok');
   });
 
-  it('passes on a 200 with empty content (key, credits and model all worked)', () => {
+  it('passes on a well-formed 200 with empty content (key, credits and model all worked)', () => {
     const r = canary({ PAID_HTTP: '200', PAID_BODY: '{"choices":[{"message":{"content":""}}]}' });
     expect(r.status).toBe(0);
+  });
+
+  it.each([
+    ['a 200 carrying a 402 error', '{"error":{"code":402,"message":"no credits"}}', 'CANARY FAILED: paid tier refused (402 no credits)'],
+    ['a 200 with no choices', '{"choices":[]}', 'CANARY FAILED: paid tier answered without a usable review'],
+    ['a 200 that is not JSON', 'Service Unavailable', 'CANARY FAILED: paid tier answered without a usable review'],
+  ])('fails on %s', (_name, body, line) => {
+    const r = canary({ PAID_HTTP: '200', PAID_BODY: body });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain(line);
+    expect(r.output).toContain('result=failed');
+  });
+
+  it('keeps GITHUB_OUTPUT to one line per key when the model name carries a line break', () => {
+    // Every route of the curl stand-in answers a refusal, whichever way it reads the model.
+    const refusal = '{"error":{"code":402}}';
+    const r = canary({ OPENROUTER_MODEL: 'paid/model\ninjected=1', PAID_HTTP: '402', PAID_BODY: refusal, FREE_BODY: refusal });
+    expect(r.status).toBe(1);
+    expect(r.output.split('\n').filter(Boolean).map((l) => l.split('=')[0])).toEqual(['result', 'reason']);
   });
 
   it('fails with the reason when the paid tier is refused, and never prints the key', () => {
