@@ -298,6 +298,20 @@ LLM_ARM_DRAWN="none"
 LLM_PROMPT_TOKENS=0
 LLM_COMPLETION_TOKENS=0
 LLM_CALL_SECONDS=0
+# Why the last LLM attempt failed (pcic-ndyi), set by call_llm and
+# attempt_llm_review: "timeout after 180s", "HTTP 402", "network error (curl 6)",
+# "HTTP 200 with no usable content", "no parseable review" ... and the provider's
+# own error code from the response body, when it sent one. Never the key, the
+# prompt or the response text.
+LLM_LAST_FAILURE=""
+LLM_LAST_ERROR_CODE=""
+# One line on why the PAID tier did not answer, set by review_llm when it fell
+# past that tier: "paid tier refused (402 no credits); provider openrouter, model
+# x/y, HTTP 402, error code 402". Empty when the paid tier answered or was not
+# tried. On 2026-11-14 every review fell back to the free tier for a night and
+# the log said nothing about why; this is that why. Library-mode consumers read
+# it to word their own failure message.
+LLM_PAID_FAILURE=""
 
 # ── Free-tier reviewers may COMMENT but never auto-APPLY (DnD-8fbkq) ────────
 # On PR #2747 the free-tier reviewer reported a tier-limit bug that did not
@@ -1514,6 +1528,36 @@ push_review_commits() {
   finish "⚠️ Could not push auto-review commits (concurrent push to the branch). A new review will run on the latest commit." "blocked" "$iterations"
 }
 
+# The provider's own error code from an error body on stdin (pcic-ndyi), or
+# nothing. OpenAI-compatible providers, OpenRouter included, answer
+# {"error":{"code":402,"message":"..."}}; some use a string `type` instead.
+# Only the CODE is kept, reduced to [A-Za-z0-9_.:-] and 40 characters: the
+# message can quote the request, and nothing from the request may reach a log.
+provider_error_code() {
+  jq -r '(.error.code // .error.type // empty) | tostring' 2>/dev/null \
+    | head -n 1 | tr -cd 'A-Za-z0-9_.:-' | cut -c1-40 || true
+}
+
+# One clause naming what kind of paid-tier failure LLM_LAST_FAILURE records
+# (pcic-ndyi), so "out of credits" and "slow provider" never read alike.
+paid_failure_kind() {
+  case "${LLM_LAST_FAILURE:-}" in
+    "HTTP 402") echo "paid tier refused (402 no credits)" ;;
+    "HTTP 401"|"HTTP 403") echo "paid tier refused (${LLM_LAST_FAILURE#HTTP }: key rejected)" ;;
+    "HTTP 404") echo "paid tier refused (404 model not found)" ;;
+    "HTTP 429") echo "paid tier rate-limited (429)" ;;
+    "HTTP 5"*) echo "paid tier provider error (${LLM_LAST_FAILURE})" ;;
+    "HTTP 200"*) echo "paid tier answered without a usable review (${LLM_LAST_FAILURE})" ;;
+    "no API key") echo "paid tier not tried (no API key)" ;;
+    "no parseable review"|"empty review summary") echo "paid tier answered without a usable review (${LLM_LAST_FAILURE})" ;;
+    "HTTP "[0-9]*) echo "paid tier refused (${LLM_LAST_FAILURE})" ;;
+    timeout*) echo "paid tier timed out (${LLM_LAST_FAILURE})" ;;
+    "network error"*) echo "paid tier unreachable (${LLM_LAST_FAILURE})" ;;
+    "") echo "paid tier failed (no reason recorded)" ;;
+    *) echo "paid tier failed (${LLM_LAST_FAILURE})" ;;
+  esac
+}
+
 # Call one LLM endpoint. Writes the raw API response body to stdout.
 # Fails (nonzero) on network error, non-200 status, or empty content.
 call_llm() {
@@ -1523,6 +1567,8 @@ call_llm() {
   # passes one (its free tier refuses a larger ask); everyone else keeps 16384.
   local max_tokens="${7:-16384}"
   local http_code body_file user_file payload_file
+  LLM_LAST_FAILURE=""
+  LLM_LAST_ERROR_CODE=""
   body_file="$(mktemp "/tmp/pr-review-llm-body-${PR_NUMBER}-XXXXXX")"
   user_file="$(mktemp "/tmp/pr-review-llm-user-${PR_NUMBER}-XXXXXX")"
   payload_file="$(mktemp "/tmp/pr-review-llm-payload-${PR_NUMBER}-XXXXXX")"
@@ -1617,9 +1663,12 @@ call_llm() {
     # content are opposite conditions, and lumping them together sent the
     # reader hunting for a parser bug that does not exist.
     case "$curl_rc" in
-      28) log "    TIMEOUT after ${elapsed}s (curl --max-time ${max_time}) — the endpoint did not respond in time. This is an upstream/provider problem, not a problem with this PR." ;;
-      6|7) log "    NETWORK ERROR after ${elapsed}s (curl ${curl_rc}) — could not resolve or connect to ${endpoint}." ;;
-      *)  log "    curl failed after ${elapsed}s (exit ${curl_rc})" ;;
+      28) log "    TIMEOUT after ${elapsed}s (curl --max-time ${max_time}) — the endpoint did not respond in time. This is an upstream/provider problem, not a problem with this PR."
+          LLM_LAST_FAILURE="timeout after ${elapsed}s" ;;
+      6|7) log "    NETWORK ERROR after ${elapsed}s (curl ${curl_rc}) — could not resolve or connect to ${endpoint}."
+          LLM_LAST_FAILURE="network error (curl ${curl_rc})" ;;
+      *)  log "    curl failed after ${elapsed}s (exit ${curl_rc})"
+          LLM_LAST_FAILURE="curl exit ${curl_rc} after ${elapsed}s" ;;
     esac
     rm -f "$body_file"
     return 1
@@ -1627,6 +1676,8 @@ call_llm() {
 
   if [ "$http_code" != "200" ]; then
     log "    HTTP ${http_code} after ${elapsed}s — $(head -c 300 "$body_file" | tr '\n' ' ')"
+    LLM_LAST_FAILURE="HTTP ${http_code}"
+    LLM_LAST_ERROR_CODE="$(provider_error_code < "$body_file")"
     rm -f "$body_file"
     return 1
   fi
@@ -1648,6 +1699,8 @@ sys.exit(0 if c and c.strip() else 1)
     # identically in the log (DnD-u1eog).
     log "    HTTP 200 after ${elapsed}s but the response carried NO usable message content"
     log "      body head: $(head -c 300 "$body_file" | tr '\n' ' ')"
+    LLM_LAST_FAILURE="HTTP 200 with no usable content after ${elapsed}s"
+    LLM_LAST_ERROR_CODE="$(provider_error_code < "$body_file")"
     rm -f "$body_file"
     return 1
   fi
@@ -1687,6 +1740,7 @@ attempt_llm_review() {
     summary_text="$(echo "$json" | jq -r '.summary // ""' 2>/dev/null | tr -d '[:space:]')"
     if [ -z "$summary_text" ]; then
       log "  Tier '${name}' returned review JSON with an empty summary — not a credible review"
+      LLM_LAST_FAILURE="empty review summary"
       return 1
     fi
     printf '%s' "$json" > "$FIXES_FILE"
@@ -1703,6 +1757,7 @@ attempt_llm_review() {
   fi
 
   log "  Tier '${name}' returned 200 but no parseable review JSON"
+  LLM_LAST_FAILURE="no parseable review"
   "$PYTHON_BIN" -c "
 import sys, json
 try:
@@ -1792,6 +1847,7 @@ review_llm() {
   # `llm_arm_drawn: sasquatch`, a pairing that never happened, straight into
   # DnD-ne83x's sample.
   LLM_ARM_DRAWN="none"
+  LLM_PAID_FAILURE=""
 
   # tier format: name|endpoint|model|api_key|json_mode
   # The cross-provider entry is a placeholder: its two arms and their
@@ -1808,6 +1864,11 @@ review_llm() {
       openrouter*)
         if [ -z "$key" ]; then
           log "  Tier '${name}' (${model}): skipped — OPENROUTER_API_KEY not set"
+          if [ "$name" = "openrouter" ]; then
+            LLM_LAST_FAILURE="no API key"
+            LLM_LAST_ERROR_CODE=""
+            record_paid_failure "$name" "$model"
+          fi
           continue
         fi
         ;;
@@ -1823,10 +1884,20 @@ review_llm() {
 
     attempt_llm_review "$name" "$endpoint" "$model" "$key" "$json_mode" "$system_prompt" "$user_content" \
       && return 0
+    [ "$name" = "openrouter" ] && record_paid_failure "$name" "$model"
     log "  Tier '${name}' did not produce a review — trying next tier"
   done
 
   return 1
+}
+
+# pcic-ndyi: record and log, in ONE line, why the paid tier did not answer:
+# provider, model, status (HTTP code, "timeout after N s", ...) and the
+# provider's error code. Never the key, never the prompt, never response text.
+record_paid_failure() {
+  local name="$1" model="$2"
+  LLM_PAID_FAILURE="$(paid_failure_kind); provider ${name}, model ${model:-unset}, status ${LLM_LAST_FAILURE:-unknown}, error code ${LLM_LAST_ERROR_CODE:-none}"
+  log "PAID TIER DID NOT ANSWER: ${LLM_PAID_FAILURE}"
 }
 
 # Ask the consumer's hook to make dependencies match the manifest.
@@ -2713,6 +2784,7 @@ review:
   runner_name: ${RUNNER_NAME:-artemis-pr-review}
   llm_tier: ${LLM_USED_TIER}
   llm_arm_drawn: ${LLM_ARM_DRAWN}
+  paid_tier_failure: $(jq -Rn --arg v "${LLM_PAID_FAILURE:-none}" '$v')
   model: ${LLM_USED_MODEL}
   model_endpoint: ${LLM_USED_ENDPOINT}
   llm_call_seconds: ${LLM_CALL_SECONDS}
