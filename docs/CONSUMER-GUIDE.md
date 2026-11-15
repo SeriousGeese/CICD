@@ -113,6 +113,24 @@ Only `openrouter` may auto-apply a fix. Every other tier — including one added
 later and forgotten — is advisory: its review comments, and a clean one still
 merges, but a proposed fix is reported as a suggestion and never applied.
 
+### When the paid tier does not answer
+
+When the chain falls past `openrouter`, the engine logs one line,
+`PAID TIER DID NOT ANSWER: paid tier refused (402 no credits); provider openrouter,
+model <model>, status HTTP 402, error code 402`, and sets `LLM_PAID_FAILURE` to the
+same text (also `paid_tier_failure` in the comment metadata). The kinds read apart:
+refused (402 no credits, 401/403 key rejected, 404 model not found), rate-limited
+(429), provider error (5xx), timed out (`timeout after N s`), unreachable, answered
+without a usable review, not tried (no API key). It never carries the key, the
+prompt or response text; the provider's error code is reduced to
+`[A-Za-z0-9_.:-]`. A library-mode consumer reads `LLM_PAID_FAILURE` after
+`review_llm` to word its own failure message.
+
+`engine/llm-canary.sh` makes one tiny call to the paid tier through the same
+`call_llm` and exits 0 (answered), 1 (did not: the same reason on stdout and in
+`$GITHUB_OUTPUT` as `reason=`) or 2 (no key or model). Schedule it daily and open
+an alert on exit 1, so an outage is known before a night of PRs.
+
 ### The cross-provider tier
 
 Off unless the action's `cross-provider-tier` input is `'true'`. With it off, or
