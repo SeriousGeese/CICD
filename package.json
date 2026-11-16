@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@typescript-eslint/parser": "^8.72.1",
+    "@typescript-eslint/parser": "^8.72.2",
     "eslint": "^10.14.0",
     "globals": "^17.14.0",
     "typescript": "^6.0.3",
