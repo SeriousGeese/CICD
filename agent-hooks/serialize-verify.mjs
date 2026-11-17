@@ -39,14 +39,24 @@
 // consumer can set AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS (unset, empty, 0 or not a positive
 // number: off, the default, and everything above is unchanged). Once a waiter has waited that
 // long for a slot, and that is still inside the lock-wait budget, it stops waiting and runs the
-// same command WITHOUT a slot, with AGENT_HOOKS_VERIFY_FALLBACK=1 in the command's environment,
-// and exits with the command's code, so a failing check still blocks the push. It takes no slot
-// on purpose: a consumer that sets the knob must make its command honour
+// same command WITHOUT a real slot, with AGENT_HOOKS_VERIFY_FALLBACK=1 in the command's
+// environment, and exits with the command's code, so a failing check still blocks the push. It
+// takes no real slot on purpose: a consumer that sets the knob must make its command honour
 // AGENT_HOOKS_VERIFY_FALLBACK=1 by running only its targeted checks, which are light enough to
-// run beside the slotted ones, and a slot it took would queue the next waiter behind a run that
-// was never meant to be heavy. It says loudly, before and after, that the run is partial and CI
-// is the authority. A run that got a slot never carries the variable, even one inherited from
-// the caller's environment.
+// run beside the slotted ones, and a real slot it took would queue the next waiter behind a run
+// that was never meant to be heavy. It says loudly, before and after, that the run is partial
+// and CI is the authority. A run that got a slot never carries the variable, even one inherited
+// from the caller's environment.
+//
+// FALLBACK SLOTS. Uncapped, every waiter past the threshold would run at once beside the holders,
+// which on a small host is the overload the slots exist to prevent. A fallback run therefore takes
+// a fallback slot of its own: `<lock dir>.fallback`, then `<lock dir>.fallback.1`… up to
+// AGENT_HOOKS_VERIFY_FALLBACK_MAX_CONCURRENT (default 1; anything but a positive number means 1),
+// with the same mkdir lock, owner stamp and stale-holder rules as the real slots, never
+// memory-gated and entirely separate from them. A waiter past the threshold that finds every
+// fallback slot taken keeps waiting, trying a real slot and then a fallback slot on each poll,
+// until the lock-wait budget gives up as before. So the worst case is (real slots) + (fallback
+// cap) concurrent verifies, and the fallback ones run the consumer's light command.
 import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -59,8 +69,7 @@ export const DEFAULT_MAX_CONCURRENT = 3;
 export const DEFAULT_SLOT_FREE_GB = 8;
 /** The variable a fallback run's command sees; see FALLBACK AFTER A WAIT above. */
 export const FALLBACK_ENV = 'AGENT_HOOKS_VERIFY_FALLBACK';
-/** What `acquire` resolves to when the wait passed the fallback threshold. */
-export const FALLBACK = Symbol('fallback');
+export const DEFAULT_FALLBACK_MAX_CONCURRENT = 1;
 const GB = 1024 ** 3;
 const POLL_MS = 1_000;
 const REPORT_EVERY_MS = 60_000;
@@ -152,21 +161,48 @@ export function tryAcquireSlot(lockDir, { maxConcurrent = 1, slotFreeBytes = DEF
   return null;
 }
 
+/** Fallback slot `i`: `<lock dir>.fallback` for the first, `<lock dir>.fallback.<i>` after it. */
+export function fallbackSlotDir(lockDir, i) {
+  return i === 0 ? `${lockDir}.fallback` : `${lockDir}.fallback.${i}`;
+}
+
 /**
- * Waits for a slot; resolves to the dir of the slot it took, to FALLBACK once it has waited
- * `fallbackMs` (when that is positive and below `waitMs`), or to null after `waitMs`.
+ * One pass over the fallback slots: the dir of the one this process now holds, or null. The same
+ * mkdir lock and stale-holder rules as the real slots (tryAcquire), never memory-gated; see
+ * FALLBACK SLOTS above.
  */
-export async function acquire(lockDir, { waitMs, fallbackMs = 0, maxConcurrent = 1, slotFreeBytes, freemem, log = (line) => process.stderr.write(`${line}\n`), sleep, clock = Date.now } = {}) {
+export function tryAcquireFallbackSlot(lockDir, { maxFallback = DEFAULT_FALLBACK_MAX_CONCURRENT, ...opts } = {}) {
+  for (let i = 0; i < maxFallback; i++) {
+    const dir = fallbackSlotDir(lockDir, i);
+    if (tryAcquire(dir, opts)) return dir;
+  }
+  return null;
+}
+
+/**
+ * Waits for a slot. Resolves to `{ dir }` for a real slot; once it has waited `fallbackMs` (when
+ * that is positive and below `waitMs`), to `{ dir, fallback: true }` for a fallback slot when one
+ * is free; or to null after `waitMs`. Every poll tries a real slot first.
+ */
+export async function acquire(lockDir, { waitMs, fallbackMs = 0, maxFallback = DEFAULT_FALLBACK_MAX_CONCURRENT, maxConcurrent = 1, slotFreeBytes, freemem, log = (line) => process.stderr.write(`${line}\n`), sleep, clock = Date.now } = {}) {
   const pause = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const started = clock();
   let lastReport = -Infinity;
+  let saidFallbackFull = false;
   for (;;) {
     const held = tryAcquireSlot(lockDir, { maxConcurrent, slotFreeBytes, freemem, log });
-    if (held) return held;
+    if (held) return { dir: held };
     const waited = clock() - started;
     // The budget is checked first: a threshold at or past it never fires, and the give-up stays.
     if (waited >= waitMs) return null;
-    if (fallbackMs > 0 && waited >= fallbackMs) return FALLBACK;
+    if (fallbackMs > 0 && waited >= fallbackMs) {
+      const fallback = tryAcquireFallbackSlot(lockDir, { maxFallback, log });
+      if (fallback) return { dir: fallback, fallback: true };
+      if (!saidFallbackFull) {
+        log(`[verify] the wait passed ${Math.round(fallbackMs / 1000)}s, but all ${maxFallback} fallback slot(s) at ${fallbackSlotDir(lockDir, 0)} are taken: still waiting for a slot or a fallback slot, up to ${Math.round(waitMs / 1000)}s.`);
+        saidFallbackFull = true;
+      }
+    }
     if (waited - lastReport >= REPORT_EVERY_MS) {
       const owner = readOwner(lockDir);
       const holder = owner ? `pid ${owner.pid}, for ${Math.round((clock() - owner.at) / 1000)}s` : 'starting';
@@ -174,7 +210,7 @@ export async function acquire(lockDir, { waitMs, fallbackMs = 0, maxConcurrent =
         ? ` Up to ${maxConcurrent} run at once while ${Math.round((slotFreeBytes ?? DEFAULT_SLOT_FREE_GB * GB) / GB)} GB is free each; ${Math.round((freemem ?? os.freemem)() / GB)} GB is free now.`
         : '';
       const partial = fallbackMs > 0 && fallbackMs < waitMs
-        ? ` After ${Math.round(fallbackMs / 1000)}s it runs a partial verify without a slot instead.`
+        ? ` After ${Math.round(fallbackMs / 1000)}s it runs a partial verify without a slot instead (at most ${maxFallback} at a time).`
         : '';
       log(`[verify] another push's local verify holds ${lockDir} (${holder}): waiting up to ${Math.round(waitMs / 1000)}s.${more}${partial} Skip it with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 (CI still runs it).`);
       lastReport = waited;
@@ -232,24 +268,30 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   const slotFreeBytes = positive(env.AGENT_HOOKS_VERIFY_SLOT_FREE_GB, DEFAULT_SLOT_FREE_GB) * GB;
   // Off (0) unless a positive number of seconds: see FALLBACK AFTER A WAIT above.
   const fallbackSeconds = positive(env.AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS, 0);
-  const held = await acquire(lockDir, { waitMs, fallbackMs: fallbackSeconds * 1000, maxConcurrent, slotFreeBytes, freemem, log, sleep, clock });
+  // At most this many fallback runs at once; anything but a positive number means the default 1.
+  const maxFallback = Math.max(1, Math.floor(positive(env.AGENT_HOOKS_VERIFY_FALLBACK_MAX_CONCURRENT, DEFAULT_FALLBACK_MAX_CONCURRENT)));
+  const held = await acquire(lockDir, { waitMs, fallbackMs: fallbackSeconds * 1000, maxFallback, maxConcurrent, slotFreeBytes, freemem, log, sleep, clock });
   if (!held) {
     log(`[verify] gave up after ${waitMs / 1000}s waiting for the local verify lock at ${lockDir}. Push again, or skip the local verify with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 (CI still runs it).`);
     return 1;
   }
-  if (held === FALLBACK) {
-    // No slot is taken and none is released: every lock dir here belongs to someone else.
-    log(`[verify] PARTIAL LOCAL VERIFY: the wait for a slot at ${lockDir} passed ${fallbackSeconds}s (AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS=${fallbackSeconds}). Running the verify WITHOUT a slot, with ${FALLBACK_ENV}=1, so it runs only its targeted checks. CI's gate is the authority for this push.`);
-    const code = await run(command, args, { ...env, [FALLBACK_ENV]: '1' });
-    log(`[verify] PARTIAL LOCAL VERIFY finished with exit ${code}: it ran without a slot after a ${fallbackSeconds}s wait, so it was not the full local verify. CI's gate is the authority for this push.`);
-    return code;
+  if (held.fallback) {
+    // A fallback slot, never a real one: the real slots are someone else's throughout.
+    try {
+      log(`[verify] PARTIAL LOCAL VERIFY: the wait for a slot at ${lockDir} passed ${fallbackSeconds}s (AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS=${fallbackSeconds}). Running the verify WITHOUT a slot (fallback slot ${held.dir}, at most ${maxFallback} at a time), with ${FALLBACK_ENV}=1, so it runs only its targeted checks. CI's gate is the authority for this push.`);
+      const code = await run(command, args, { ...env, [FALLBACK_ENV]: '1' });
+      log(`[verify] PARTIAL LOCAL VERIFY finished with exit ${code}: it ran without a slot after a ${fallbackSeconds}s wait, so it was not the full local verify. CI's gate is the authority for this push.`);
+      return code;
+    } finally {
+      release(held.dir);
+    }
   }
   try {
     const childEnv = { ...env };
     delete childEnv[FALLBACK_ENV]; // A stale exported value must not make a slotted run partial.
     return await run(command, args, childEnv);
   } finally {
-    release(held);
+    release(held.dir);
   }
 }
 

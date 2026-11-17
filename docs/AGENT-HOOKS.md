@@ -119,24 +119,35 @@ git pre-push hooks. Wiring: SeriousGeese/agent-tooling `reference/pre-push`.
 | `warn-recreated-branch.mjs` | Warns when a push recreates a branch whose PR already merged (and was deleted), so the push has no PR. Never blocks. |
 | `warn-dropped-files.mjs` | Warns when files present at the merge-base are absent from HEAD, the sign of a stale rebase that dropped a merged commit. Never blocks. |
 | `ensure-ssh-keepalive.mjs` | Sets an SSH keepalive for the repository so a push survives a long local verify. |
-| `serialize-verify.mjs` | Runs the consumer's local verify under a per-user lock with stdin closed, with a few memory-gated concurrent slots. Knobs: `<PREFIX>VERIFY_LOCK_WAIT_SECONDS`, `<PREFIX>VERIFY_MAX_CONCURRENT`, `<PREFIX>VERIFY_SLOT_FREE_GB`, `<PREFIX>VERIFY_FALLBACK_AFTER_SECONDS` (below), `<PREFIX>SKIP_LOCAL_VERIFY`. |
+| `serialize-verify.mjs` | Runs the consumer's local verify under a per-user lock with stdin closed, with a few memory-gated concurrent slots. Knobs: `<PREFIX>VERIFY_LOCK_WAIT_SECONDS`, `<PREFIX>VERIFY_MAX_CONCURRENT`, `<PREFIX>VERIFY_SLOT_FREE_GB`, `<PREFIX>VERIFY_FALLBACK_AFTER_SECONDS` and `<PREFIX>VERIFY_FALLBACK_MAX_CONCURRENT` (below), `<PREFIX>SKIP_LOCAL_VERIFY`. |
 
 **The wait-threshold fallback (`<PREFIX>VERIFY_FALLBACK_AFTER_SECONDS`).** Off unless set to a
 positive number of seconds N; unset, empty, `0` or anything else leaves the hook exactly as
 above. When a waiter has waited N seconds for a slot, and N is below
-`<PREFIX>VERIFY_LOCK_WAIT_SECONDS`, it stops waiting and runs the same command **without a
-slot**, with `<PREFIX>VERIFY_FALLBACK=1` in the command's environment, and exits with the
-command's code, so a failing check still blocks the push. It prints, before and after, that
+`<PREFIX>VERIFY_LOCK_WAIT_SECONDS`, it stops waiting for a real slot and runs the same command
+**without one**, in a fallback slot, with `<PREFIX>VERIFY_FALLBACK=1` in the command's
+environment, and exits with the command's code, so a failing check still blocks the push.
+
+**The fallback cap (`<PREFIX>VERIFY_FALLBACK_MAX_CONCURRENT`, default 1; anything but a positive
+number means 1).** Fallback runs take fallback slots of their own (`<lock dir>.fallback`,
+`<lock dir>.fallback.1`, ...): the same mkdir lock, owner stamp and stale-holder rules as the real
+slots, never memory-gated, entirely separate from them. A waiter past the threshold that finds
+every fallback slot taken keeps waiting, trying a real slot and then a fallback slot on each poll,
+until the lock-wait budget gives up as usual; a real slot that frees on a poll is always taken
+first. A fallback run releases only its own fallback slot. The worst case is therefore
+`<PREFIX>VERIFY_MAX_CONCURRENT` + `<PREFIX>VERIFY_FALLBACK_MAX_CONCURRENT` concurrent verifies
+(3 + 1 by default), and the fallback ones run the consumer's light command. It prints, before and after, that
 this was a partial local verify and that CI's gate is the authority for the push. A run that
 got a slot never carries `<PREFIX>VERIFY_FALLBACK`, even one exported by the caller. When N is
 at or past the lock-wait budget, the budget's give-up (exit 1) wins as before.
 
 The contract: **a consumer that sets the knob must make its verify command honour
 `<PREFIX>VERIFY_FALLBACK=1` by running only its targeted checks** (the files its diff
-reaches, not the whole suite). The fallback takes no slot on purpose: its command is the
-light one, so it runs beside the slotted verifies instead of queueing the next waiter behind
-it. A consumer whose command ignores the variable would run its full verify unslotted, which
-is the overload the slots exist to prevent.
+reaches, not the whole suite) and so is genuinely lighter than its slotted run. The fallback
+takes no real slot on purpose: its command is the light one, so it runs beside the slotted
+verifies instead of queueing the next waiter behind it. A consumer whose fallback command is no
+lighter than its slotted one gains a cap's worth of extra full verifies, which is the overload
+the slots exist to prevent.
 
 ## The `worktree` set
 

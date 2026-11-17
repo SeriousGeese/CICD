@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { MAX_HOLD_MS, STAMP_GRACE_MS, main, readOwner, release, slotDir, staleReason, tryAcquire, tryAcquireSlot } from './serialize-verify.mjs';
+import { MAX_HOLD_MS, STAMP_GRACE_MS, fallbackSlotDir, main, readOwner, release, slotDir, staleReason, tryAcquire, tryAcquireSlot } from './serialize-verify.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, 'serialize-verify.mjs');
@@ -22,6 +22,16 @@ const SCRIPT = path.join(HERE, 'serialize-verify.mjs');
 function scratch() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'serialize-verify-'));
   return { dir, lock: path.join(dir, 'nested', 'verify.lock.d'), done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+/**
+ * The caller's environment without the fallback knobs (or the variable a fallback run sets), so
+ * a value exported in the shell that runs these tests cannot change what a test pins; then `set`.
+ */
+function cleanEnv(set = {}) {
+  const env = { ...process.env };
+  for (const k of ['AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS', 'AGENT_HOOKS_VERIFY_FALLBACK_MAX_CONCURRENT', 'AGENT_HOOKS_VERIFY_FALLBACK']) delete env[k];
+  return { ...env, ...set };
 }
 
 function stamp(lock, pid, at) {
@@ -94,6 +104,7 @@ test('the command runs with stdin closed: it never sees the ref lines git hands 
     // Exits 3 if any byte reaches it, 0 on an immediate EOF.
     const child = "let n=0;process.stdin.on('data',d=>{n+=d.length});process.stdin.on('end',()=>process.exit(n?3:0))";
     const r = spawnSync(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', child], {
+      env: cleanEnv(),
       input: 'refs/heads/b 1111111111111111111111111111111111111111 refs/heads/b 2222222222222222222222222222222222222222\n',
       encoding: 'utf8',
     });
@@ -105,7 +116,7 @@ test('the command runs with stdin closed: it never sees the ref lines git hands 
 test("the command's exit code is the hook's", () => {
   const s = scratch();
   try {
-    const r = spawnSync(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', 'process.exit(7)'], { encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', 'process.exit(7)'], { encoding: 'utf8', env: cleanEnv() });
     assert.equal(r.status, 7);
   } finally { s.done(); }
 });
@@ -117,7 +128,7 @@ test('two pushes at once run their verifies one after the other, never overlappi
     const body = `const fs=require('node:fs');const a=Date.now();setTimeout(()=>{fs.appendFileSync(${JSON.stringify(log)},a+' '+Date.now()+'\\n')},1500)`;
     const run = () => new Promise((resolve) => {
       // One slot: what this test pins is the lock itself, not how many slots the host's memory buys.
-      const p = spawn(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', body], { stdio: 'ignore', env: { ...process.env, AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' } });
+      const p = spawn(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', body], { stdio: 'ignore', env: cleanEnv({ AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' }) });
       p.on('exit', resolve);
     });
     const codes = await Promise.all([run(), run()]);
@@ -152,7 +163,7 @@ test('with slots and the memory for them, two pushes run their verifies at once'
   try {
     const log = path.join(s.dir, 'intervals.txt');
     const body = `const fs=require('node:fs');const a=Date.now();setTimeout(()=>{fs.appendFileSync(${JSON.stringify(log)},a+' '+Date.now()+'\\n')},1500)`;
-    const env = { ...process.env, AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '2', AGENT_HOOKS_VERIFY_SLOT_FREE_GB: '0.000001' };
+    const env = cleanEnv({ AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '2', AGENT_HOOKS_VERIFY_SLOT_FREE_GB: '0.000001' });
     const run = () => new Promise((resolve) => {
       const p = spawn(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', body], { stdio: 'ignore', env });
       p.on('exit', resolve);
@@ -173,7 +184,7 @@ test('it gives up loudly when a live holder keeps the lock past the wait, and ru
     const marker = path.join(s.dir, 'ran');
     const r = spawnSync(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'x')`], {
       encoding: 'utf8',
-      env: { ...process.env, AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '0', AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' },
+      env: cleanEnv({ AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '0', AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' }),
     });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /gave up .* AGENT_HOOKS_SKIP_LOCAL_VERIFY=1/);
@@ -292,6 +303,173 @@ test("a fallback run neither releases nor breaks another owner's lock", async ()
     assert.ok(fs.existsSync(s.lock), "the fallback removed the other owner's lock");
     assert.equal(readOwner(s.lock).pid, process.pid, "the other owner's stamp changed");
     assert.deepEqual([1, 2].filter((i) => fs.existsSync(slotDir(s.lock, i))), [], 'a slot dir was left behind');
+    assert.equal(fs.existsSync(fallbackSlotDir(s.lock, 0)), false, 'the fallback slot outlived the run');
+  } finally { s.done(); }
+});
+
+// ---------------------------------------------------------------------------------------------
+// FALLBACK SLOTS: uncapped, three waiters at a 1 s threshold all ran beside the holder (four
+// verifies where the lock allows three). Several waiters share one fake clock here: every sleep
+// parks until `tick()` advances the clock a second and wakes them all, and a fallback `run` stays
+// open until the test finishes it, so concurrency is observable.
+
+function sharedClock() {
+  let t = 1_000_000;
+  let parked = [];
+  return {
+    clock: () => t,
+    sleep: () => new Promise((resolve) => parked.push(resolve)),
+    async tick(n = 1) {
+      for (let i = 0; i < n; i++) {
+        t += 1_000;
+        const wake = parked;
+        parked = [];
+        for (const r of wake) r();
+        await new Promise((r) => setImmediate(r));
+      }
+    },
+    parked: () => parked.length,
+  };
+}
+
+/** A waiter on the shared clock; its run stays open until `finish(code)`. */
+function waiter(s, sc, env, name) {
+  const w = { name, runs: [], logs: [], exit: undefined };
+  let finish;
+  w.finish = (code = 0) => finish(code);
+  w.done = main([s.lock, '--', 'node', 'verify.mjs'], { AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '3', AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '60', ...env }, {
+    clock: sc.clock,
+    sleep: sc.sleep,
+    freemem: () => 1, // Only the first real slot is ever in play.
+    log: (line) => w.logs.push(line),
+    run: (_c, _a, childEnv) => new Promise((resolve) => {
+      w.runs.push({ fallback: childEnv.AGENT_HOOKS_VERIFY_FALLBACK === '1', hasVar: Object.hasOwn(childEnv, 'AGENT_HOOKS_VERIFY_FALLBACK') });
+      finish = resolve;
+    }),
+  }).then((code) => { w.exit = code; return code; });
+  return w;
+}
+
+const fallbackDirs = (lock) => [0, 1, 2, 3].filter((i) => fs.existsSync(fallbackSlotDir(lock, i)));
+
+for (const frees of ['the real slot', 'the fallback slot']) {
+  test(`fallback cap 1, two waiters past the threshold: one runs as a fallback, the other waits and takes ${frees} when it frees`, async () => {
+    const s = scratch();
+    try {
+      stamp(s.lock, process.pid, Date.now());
+      const sc = sharedClock();
+      const env = { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5' };
+      const a = waiter(s, sc, env, 'a');
+      const b = waiter(s, sc, env, 'b');
+      await sc.tick(5);
+      const [first, second] = a.runs.length ? [a, b] : [b, a];
+      assert.equal(first.runs.length, 1, 'nobody ran as a fallback at the threshold');
+      assert.equal(first.runs[0].fallback, true);
+      assert.equal(second.runs.length, 0, 'a second fallback ran beside the first (cap 1)');
+      assert.deepEqual(fallbackDirs(s.lock), [0]);
+      await sc.tick(3);
+      assert.equal(second.runs.length, 0, 'the second waiter stopped waiting');
+      assert.match(second.logs.join('\n'), /all 1 fallback slot\(s\) .* are taken: still waiting/);
+      if (frees === 'the real slot') {
+        fs.rmSync(s.lock, { recursive: true, force: true });
+        await sc.tick();
+        assert.equal(second.runs.length, 1);
+        assert.deepEqual(second.runs[0], { fallback: false, hasVar: false }, 'the freed real slot was not taken as a slotted run');
+        assert.equal(readOwner(s.lock).pid, process.pid);
+        second.finish(0);
+        first.finish(0);
+      } else {
+        first.finish(0);
+        await first.done;
+        assert.deepEqual(fallbackDirs(s.lock), [], 'the finished fallback kept its slot');
+        await sc.tick();
+        assert.equal(second.runs.length, 1);
+        assert.deepEqual(second.runs[0], { fallback: true, hasVar: true });
+        second.finish(0);
+      }
+      assert.deepEqual(await Promise.all([a.done, b.done]), [0, 0]);
+      assert.deepEqual(fallbackDirs(s.lock), [], 'a fallback slot outlived its run');
+    } finally { s.done(); }
+  });
+}
+
+test('fallback cap 2, three waiters past the threshold: exactly two run as fallbacks, the third waits', async () => {
+  const s = scratch();
+  try {
+    stamp(s.lock, process.pid, Date.now());
+    const sc = sharedClock();
+    const env = { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5', AGENT_HOOKS_VERIFY_FALLBACK_MAX_CONCURRENT: '2' };
+    const ws = ['a', 'b', 'c'].map((n) => waiter(s, sc, env, n));
+    await sc.tick(8);
+    assert.equal(ws.filter((w) => w.runs.length).length, 2, 'not exactly two fallbacks at once');
+    assert.deepEqual(fallbackDirs(s.lock), [0, 1]);
+    const idle = ws.find((w) => !w.runs.length);
+    assert.equal(idle.exit, undefined, 'the third gave up instead of waiting');
+    for (const w of ws) if (w.runs.length) w.finish(0);
+    await sc.tick();
+    assert.equal(idle.runs.length, 1);
+    assert.equal(idle.runs[0].fallback, true);
+    idle.finish(0);
+    assert.deepEqual(await Promise.all(ws.map((w) => w.done)), [0, 0, 0]);
+    assert.deepEqual(fallbackDirs(s.lock), []);
+    assert.equal(readOwner(s.lock).pid, process.pid, "the holder's real slot was touched");
+  } finally { s.done(); }
+});
+
+for (const bad of ['0', '-1', 'abc', '']) {
+  test(`an invalid fallback cap (${JSON.stringify(bad)}) means the default 1`, async () => {
+    const s = scratch();
+    try {
+      stamp(s.lock, process.pid, Date.now());
+      const sc = sharedClock();
+      const env = { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5', AGENT_HOOKS_VERIFY_FALLBACK_MAX_CONCURRENT: bad };
+      const ws = ['a', 'b'].map((n) => waiter(s, sc, env, n));
+      await sc.tick(7);
+      assert.equal(ws.filter((w) => w.runs.length).length, 1, `${JSON.stringify(bad)} did not cap the fallbacks at 1`);
+      for (const w of ws) if (w.runs.length) w.finish(0);
+      await sc.tick();
+      for (const w of ws) if (w.runs.length === 1 && w.exit === undefined) w.finish(0);
+      await Promise.all(ws.map((w) => w.done));
+    } finally { s.done(); }
+  });
+}
+
+test('a fallback slot whose holder is gone is broken and taken, and released after the run', async () => {
+  const s = scratch();
+  try {
+    stamp(s.lock, process.pid, Date.now());
+    const dead = spawnSync(process.execPath, ['-e', '']).pid; // Exited: certainly not alive.
+    stamp(fallbackSlotDir(s.lock, 0), dead, Date.now());
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5', AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '30' });
+    assert.equal(r.runs.length, 1, 'the stale fallback slot was never broken');
+    assert.equal(r.runs[0].env.AGENT_HOOKS_VERIFY_FALLBACK, '1');
+    assert.match(r.events.join('\n'), new RegExp(`holder \\(pid ${dead}\\) is gone`));
+    assert.equal(fs.existsSync(fallbackSlotDir(s.lock, 0)), false);
+  } finally { s.done(); }
+});
+
+test("a fallback run releases its own fallback slot and nothing else: another holder's fallback slot stays", async () => {
+  const s = scratch();
+  try {
+    stamp(s.lock, process.pid, Date.now());
+    stamp(fallbackSlotDir(s.lock, 0), process.ppid, Date.now()); // A live other holder.
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5', AGENT_HOOKS_VERIFY_FALLBACK_MAX_CONCURRENT: '2' });
+    assert.equal(r.runs.length, 1);
+    assert.equal(r.runs[0].env.AGENT_HOOKS_VERIFY_FALLBACK, '1');
+    assert.equal(readOwner(fallbackSlotDir(s.lock, 0)).pid, process.ppid, "the other holder's fallback slot was touched");
+    assert.equal(fs.existsSync(fallbackSlotDir(s.lock, 1)), false, 'its own fallback slot outlived the run');
+    assert.equal(readOwner(s.lock).pid, process.pid);
+  } finally { s.done(); }
+});
+
+test('a real slot that frees on exactly the threshold poll is taken slotted, not fallen back (acquire before the threshold check)', async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5', AGENT_HOOKS_VERIFY_FALLBACK: '1' }, { freeAfterSleeps: 5 });
+    assert.equal(r.runs.length, 1);
+    assert.equal(r.runs[0].waitedMs, 5_000);
+    assert.equal(Object.hasOwn(r.runs[0].env, 'AGENT_HOOKS_VERIFY_FALLBACK'), false, 'fell back although a real slot was free on that poll');
+    assert.doesNotMatch(r.events.join('\n'), /PARTIAL/);
   } finally { s.done(); }
 });
 
@@ -361,7 +539,7 @@ test('end to end: past the threshold the real command runs without a slot and se
     stamp(s.lock, process.pid, Date.now());
     const r = spawnSync(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', "process.exit(process.env.AGENT_HOOKS_VERIFY_FALLBACK === '1' ? 4 : 9)"], {
       encoding: 'utf8',
-      env: { ...process.env, AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '1', AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '30', AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' },
+      env: cleanEnv({ AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '1', AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '30', AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' }),
     });
     assert.equal(r.status, 4, `the command did not see the variable (exit ${r.status}): ${r.stderr}`);
     assert.match(r.stderr, /PARTIAL LOCAL VERIFY: .*passed 1s/);
