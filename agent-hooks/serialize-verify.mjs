@@ -33,6 +33,20 @@
 // the budget for one concurrent full jest run. Measured on every attempt, so a host
 // already busy with other verifies (or anything else) falls back to one at a time by itself. An
 // older hook that knows only `<lock dir>` still serializes against the first slot.
+//
+// FALLBACK AFTER A WAIT. Slots did not save a host with little memory: four sessions on a box
+// with about 4.6 GB free each waited for the one slot, and no push landed in 1.5 hours. A
+// consumer can set AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS (unset, empty, 0 or not a positive
+// number: off, the default, and everything above is unchanged). Once a waiter has waited that
+// long for a slot, and that is still inside the lock-wait budget, it stops waiting and runs the
+// same command WITHOUT a slot, with AGENT_HOOKS_VERIFY_FALLBACK=1 in the command's environment,
+// and exits with the command's code, so a failing check still blocks the push. It takes no slot
+// on purpose: a consumer that sets the knob must make its command honour
+// AGENT_HOOKS_VERIFY_FALLBACK=1 by running only its targeted checks, which are light enough to
+// run beside the slotted ones, and a slot it took would queue the next waiter behind a run that
+// was never meant to be heavy. It says loudly, before and after, that the run is partial and CI
+// is the authority. A run that got a slot never carries the variable, even one inherited from
+// the caller's environment.
 import { spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -43,6 +57,10 @@ export const STAMP_GRACE_MS = 5_000;
 export const MAX_HOLD_MS = 2 * 60 * 60 * 1000;
 export const DEFAULT_MAX_CONCURRENT = 3;
 export const DEFAULT_SLOT_FREE_GB = 8;
+/** The variable a fallback run's command sees; see FALLBACK AFTER A WAIT above. */
+export const FALLBACK_ENV = 'AGENT_HOOKS_VERIFY_FALLBACK';
+/** What `acquire` resolves to when the wait passed the fallback threshold. */
+export const FALLBACK = Symbol('fallback');
 const GB = 1024 ** 3;
 const POLL_MS = 1_000;
 const REPORT_EVERY_MS = 60_000;
@@ -134,23 +152,31 @@ export function tryAcquireSlot(lockDir, { maxConcurrent = 1, slotFreeBytes = DEF
   return null;
 }
 
-/** Waits for a slot; resolves to the dir of the slot it took, or null after `waitMs`. */
-export async function acquire(lockDir, { waitMs, maxConcurrent = 1, slotFreeBytes, freemem, log = (line) => process.stderr.write(`${line}\n`), sleep } = {}) {
+/**
+ * Waits for a slot; resolves to the dir of the slot it took, to FALLBACK once it has waited
+ * `fallbackMs` (when that is positive and below `waitMs`), or to null after `waitMs`.
+ */
+export async function acquire(lockDir, { waitMs, fallbackMs = 0, maxConcurrent = 1, slotFreeBytes, freemem, log = (line) => process.stderr.write(`${line}\n`), sleep, clock = Date.now } = {}) {
   const pause = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const started = Date.now();
+  const started = clock();
   let lastReport = -Infinity;
   for (;;) {
     const held = tryAcquireSlot(lockDir, { maxConcurrent, slotFreeBytes, freemem, log });
     if (held) return held;
-    const waited = Date.now() - started;
+    const waited = clock() - started;
+    // The budget is checked first: a threshold at or past it never fires, and the give-up stays.
     if (waited >= waitMs) return null;
+    if (fallbackMs > 0 && waited >= fallbackMs) return FALLBACK;
     if (waited - lastReport >= REPORT_EVERY_MS) {
       const owner = readOwner(lockDir);
-      const holder = owner ? `pid ${owner.pid}, for ${Math.round((Date.now() - owner.at) / 1000)}s` : 'starting';
+      const holder = owner ? `pid ${owner.pid}, for ${Math.round((clock() - owner.at) / 1000)}s` : 'starting';
       const more = maxConcurrent > 1
         ? ` Up to ${maxConcurrent} run at once while ${Math.round((slotFreeBytes ?? DEFAULT_SLOT_FREE_GB * GB) / GB)} GB is free each; ${Math.round((freemem ?? os.freemem)() / GB)} GB is free now.`
         : '';
-      log(`[verify] another push's local verify holds ${lockDir} (${holder}): waiting up to ${Math.round(waitMs / 1000)}s.${more} Skip it with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 (CI still runs it).`);
+      const partial = fallbackMs > 0 && fallbackMs < waitMs
+        ? ` After ${Math.round(fallbackMs / 1000)}s it runs a partial verify without a slot instead.`
+        : '';
+      log(`[verify] another push's local verify holds ${lockDir} (${holder}): waiting up to ${Math.round(waitMs / 1000)}s.${more}${partial} Skip it with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 (CI still runs it).`);
       lastReport = waited;
     }
     await pause(POLL_MS);
@@ -164,10 +190,10 @@ function positive(raw, fallback) {
 }
 
 /** Run `command args` with stdin closed and stdout/stderr passed through; resolves to its exit code. */
-export function runWithoutStdin(command, args) {
+export function runWithoutStdin(command, args, env = process.env) {
   const bin = command === 'node' ? process.execPath : command;
   return new Promise((resolve) => {
-    const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'] });
+    const child = spawn(bin, args, { stdio: ['ignore', 'inherit', 'inherit'], env });
     const forward = (signal) => () => child.kill(signal);
     const onInt = forward('SIGINT');
     const onTerm = forward('SIGTERM');
@@ -185,11 +211,18 @@ export function runWithoutStdin(command, args) {
   });
 }
 
-export async function main(argv = process.argv.slice(2), env = process.env) {
+/**
+ * The hook. `deps` exists for tests: `sleep`, `clock` and `freemem` drive the wait without real
+ * time or memory, `log` receives each stderr line, and `run(command, args, env)` stands in for
+ * runWithoutStdin.
+ */
+export async function main(argv = process.argv.slice(2), env = process.env, deps = {}) {
+  const { sleep, clock, freemem, run = runWithoutStdin } = deps;
+  const log = deps.log ?? ((line) => process.stderr.write(`${line}\n`));
   const sep = argv.indexOf('--');
   const lockDir = argv[0];
   if (!lockDir || sep !== 1 || argv.length < 3) {
-    process.stderr.write('usage: serialize-verify.mjs <lock dir> -- <command> [args...]\n');
+    log('usage: serialize-verify.mjs <lock dir> -- <command> [args...]');
     return 2;
   }
   const [command, ...args] = argv.slice(2);
@@ -197,13 +230,24 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const waitMs = (Number.isFinite(waitSeconds) && waitSeconds >= 0 ? waitSeconds : 1800) * 1000;
   const maxConcurrent = Math.floor(positive(env.AGENT_HOOKS_VERIFY_MAX_CONCURRENT, DEFAULT_MAX_CONCURRENT));
   const slotFreeBytes = positive(env.AGENT_HOOKS_VERIFY_SLOT_FREE_GB, DEFAULT_SLOT_FREE_GB) * GB;
-  const held = await acquire(lockDir, { waitMs, maxConcurrent, slotFreeBytes });
+  // Off (0) unless a positive number of seconds: see FALLBACK AFTER A WAIT above.
+  const fallbackSeconds = positive(env.AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS, 0);
+  const held = await acquire(lockDir, { waitMs, fallbackMs: fallbackSeconds * 1000, maxConcurrent, slotFreeBytes, freemem, log, sleep, clock });
   if (!held) {
-    process.stderr.write(`[verify] gave up after ${waitMs / 1000}s waiting for the local verify lock at ${lockDir}. Push again, or skip the local verify with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 (CI still runs it).\n`);
+    log(`[verify] gave up after ${waitMs / 1000}s waiting for the local verify lock at ${lockDir}. Push again, or skip the local verify with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 (CI still runs it).`);
     return 1;
   }
+  if (held === FALLBACK) {
+    // No slot is taken and none is released: every lock dir here belongs to someone else.
+    log(`[verify] PARTIAL LOCAL VERIFY: the wait for a slot at ${lockDir} passed ${fallbackSeconds}s (AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS=${fallbackSeconds}). Running the verify WITHOUT a slot, with ${FALLBACK_ENV}=1, so it runs only its targeted checks. CI's gate is the authority for this push.`);
+    const code = await run(command, args, { ...env, [FALLBACK_ENV]: '1' });
+    log(`[verify] PARTIAL LOCAL VERIFY finished with exit ${code}: it ran without a slot after a ${fallbackSeconds}s wait, so it was not the full local verify. CI's gate is the authority for this push.`);
+    return code;
+  }
   try {
-    return await runWithoutStdin(command, args);
+    const childEnv = { ...env };
+    delete childEnv[FALLBACK_ENV]; // A stale exported value must not make a slotted run partial.
+    return await run(command, args, childEnv);
   } finally {
     release(held);
   }

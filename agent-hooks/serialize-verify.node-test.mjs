@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { MAX_HOLD_MS, STAMP_GRACE_MS, readOwner, release, slotDir, staleReason, tryAcquire, tryAcquireSlot } from './serialize-verify.mjs';
+import { MAX_HOLD_MS, STAMP_GRACE_MS, main, readOwner, release, slotDir, staleReason, tryAcquire, tryAcquireSlot } from './serialize-verify.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(HERE, 'serialize-verify.mjs');
@@ -178,6 +178,193 @@ test('it gives up loudly when a live holder keeps the lock past the wait, and ru
     assert.equal(r.status, 1);
     assert.match(r.stderr, /gave up .* AGENT_HOOKS_SKIP_LOCAL_VERIFY=1/);
     assert.equal(fs.existsSync(marker), false, 'it ran the command without the lock');
+    assert.equal(readOwner(s.lock).pid, process.pid, "it released the holder's lock");
+  } finally { s.done(); }
+});
+
+// ---------------------------------------------------------------------------------------------
+// FALLBACK AFTER A WAIT: four sessions on a host with about 4.6 GB free waited for the one slot
+// and landed no push in 1.5 hours. These drive main() on a fake clock (each sleep advances it), so
+// a 300 s threshold costs no real time, with a `run` stand-in that records what the command saw.
+// The lock is stamped with this process's own pid: certainly alive, and a stray release(lockDir)
+// would visibly remove it.
+
+/** main() against a lock held by a live stand-in, on a fake clock. */
+async function drive(s, env, { freeAfterSleeps = Infinity, code = 0 } = {}) {
+  stamp(s.lock, process.pid, Date.now());
+  const start = 1_000_000;
+  let t = start;
+  let sleeps = 0;
+  const events = [];
+  const runs = [];
+  const deps = {
+    clock: () => t,
+    sleep: async (ms) => {
+      t += ms;
+      sleeps += 1;
+      if (sleeps === freeAfterSleeps) fs.rmSync(s.lock, { recursive: true, force: true });
+    },
+    freemem: () => 1, // Never the memory for a second slot: only the first one is in play.
+    log: (line) => events.push(line),
+    run: async (command, args, childEnv) => {
+      events.push('<run>');
+      runs.push({
+        command,
+        args,
+        env: { ...childEnv },
+        waitedMs: t - start,
+        lockOwner: readOwner(s.lock)?.pid ?? null,
+        extraSlots: [1, 2].filter((i) => fs.existsSync(slotDir(s.lock, i))),
+      });
+      return code;
+    },
+  };
+  const exit = await main([s.lock, '--', 'node', 'verify.mjs'], { AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '3', ...env }, deps);
+  return { exit, events, runs, sleeps, waitedMs: t - start };
+}
+
+const GAVE_UP = /^\[verify\] gave up after (\d+)s waiting for the local verify lock at .*\. Push again, or skip the local verify with AGENT_HOOKS_SKIP_LOCAL_VERIFY=1 \(CI still runs it\)\.$/;
+
+test('fallback knob unset: a waiter that never gets a slot waits the whole budget, gives up as before, and runs nothing', async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '10' });
+    assert.equal(r.exit, 1);
+    assert.equal(r.runs.length, 0, 'it ran the command without a slot');
+    assert.equal(r.waitedMs, 10_000, 'it did not wait the full budget');
+    assert.match(r.events.at(-1), GAVE_UP);
+    assert.equal(GAVE_UP.exec(r.events.at(-1))[1], '10');
+    assert.doesNotMatch(r.events.join('\n'), /FALLBACK|PARTIAL/);
+    assert.equal(readOwner(s.lock).pid, process.pid);
+  } finally { s.done(); }
+});
+
+test('fallback knob set, slot freed before the threshold: a slotted run, and an inherited FALLBACK variable is removed', async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '300', AGENT_HOOKS_VERIFY_FALLBACK: '1' }, { freeAfterSleeps: 120 });
+    assert.equal(r.exit, 0);
+    assert.equal(r.runs.length, 1);
+    assert.equal(r.runs[0].lockOwner, process.pid, 'the command ran without holding the slot');
+    assert.equal(r.runs[0].waitedMs, 120_000);
+    assert.equal(Object.hasOwn(r.runs[0].env, 'AGENT_HOOKS_VERIFY_FALLBACK'), false, 'a slotted run carried AGENT_HOOKS_VERIFY_FALLBACK');
+    assert.doesNotMatch(r.events.join('\n'), /PARTIAL/);
+    assert.equal(fs.existsSync(s.lock), false, 'the slot outlived the command');
+  } finally { s.done(); }
+});
+
+test('a slot taken at once never carries the FALLBACK variable, even one exported by the caller', async () => {
+  const s = scratch();
+  try {
+    const runs = [];
+    const exit = await main([s.lock, '--', 'node', 'verify.mjs'], { AGENT_HOOKS_VERIFY_FALLBACK: '1', AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '300', KEEP: 'me' }, {
+      log: () => {},
+      run: async (_c, _a, childEnv) => { runs.push({ ...childEnv }); return 0; },
+    });
+    assert.equal(exit, 0);
+    assert.equal(runs.length, 1);
+    assert.equal(Object.hasOwn(runs[0], 'AGENT_HOOKS_VERIFY_FALLBACK'), false, 'a slotted run carried AGENT_HOOKS_VERIFY_FALLBACK');
+    assert.equal(runs[0].KEEP, 'me', 'the rest of the environment was not passed through');
+  } finally { s.done(); }
+});
+
+test('fallback knob set, no slot by the threshold: the command runs once, without a slot, with AGENT_HOOKS_VERIFY_FALLBACK=1', async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '300', KEEP: 'me' });
+    assert.equal(r.exit, 0);
+    assert.equal(r.runs.length, 1, 'the command did not run exactly once');
+    const [run] = r.runs;
+    assert.equal(run.env.AGENT_HOOKS_VERIFY_FALLBACK, '1');
+    assert.equal(run.env.KEEP, 'me');
+    assert.deepEqual([run.command, run.args], ['node', ['verify.mjs']]);
+    assert.equal(run.lockOwner, process.pid, "the fallback touched the other owner's lock");
+    assert.deepEqual(run.extraSlots, [], 'the fallback took a slot');
+    assert.equal(run.waitedMs, 300_000);
+  } finally { s.done(); }
+});
+
+test("a fallback run neither releases nor breaks another owner's lock", async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5' });
+    assert.equal(r.runs.length, 1);
+    assert.ok(fs.existsSync(s.lock), "the fallback removed the other owner's lock");
+    assert.equal(readOwner(s.lock).pid, process.pid, "the other owner's stamp changed");
+    assert.deepEqual([1, 2].filter((i) => fs.existsSync(slotDir(s.lock, i))), [], 'a slot dir was left behind');
+  } finally { s.done(); }
+});
+
+test("the fallback run's exit code is the hook's: a failing targeted verify still blocks the push", async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5' }, { code: 5 });
+    assert.equal(r.runs.length, 1);
+    assert.equal(r.exit, 5);
+  } finally { s.done(); }
+});
+
+test('fallback boundary: no fallback at N-1 seconds, fallback at exactly N', async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '5', AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '30' });
+    assert.equal(r.runs.length, 1);
+    // One-second polls: the attempt at 4 s waits on, the attempt at 5 s falls back.
+    assert.equal(r.sleeps, 5, 'it fell back before or after the threshold');
+    assert.equal(r.runs[0].waitedMs, 5_000);
+  } finally { s.done(); }
+});
+
+for (const [label, n] of [['equal to', '30'], ['greater than', '45']]) {
+  test(`a fallback threshold ${label} the lock-wait budget never fires: today's give-up wins`, async () => {
+    const s = scratch();
+    try {
+      const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: n, AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '30' });
+      assert.equal(r.exit, 1);
+      assert.equal(r.runs.length, 0, 'it fell back instead of giving up');
+      assert.equal(r.waitedMs, 30_000);
+      assert.match(r.events.at(-1), GAVE_UP);
+      assert.doesNotMatch(r.events.join('\n'), /PARTIAL/);
+    } finally { s.done(); }
+  });
+}
+
+for (const bad of ['abc', '-5', '0', '']) {
+  test(`an invalid fallback threshold (${JSON.stringify(bad)}) is no fallback at all`, async () => {
+    const s = scratch();
+    try {
+      const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: bad, AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '3' });
+      assert.equal(r.exit, 1);
+      assert.equal(r.runs.length, 0, `${JSON.stringify(bad)} turned the fallback on`);
+      assert.equal(r.waitedMs, 3_000);
+      assert.match(r.events.at(-1), GAVE_UP);
+    } finally { s.done(); }
+  });
+}
+
+test('the partial-verify notice comes before the command starts, names the threshold, and repeats after it ends', async () => {
+  const s = scratch();
+  try {
+    const r = await drive(s, { AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '7' }, { code: 3 });
+    const runAt = r.events.indexOf('<run>');
+    assert.ok(runAt > 0, 'the command did not run, or ran before any notice');
+    const before = r.events.slice(0, runAt).join('\n');
+    const after = r.events.slice(runAt + 1).join('\n');
+    assert.match(before, /PARTIAL LOCAL VERIFY: the wait for a slot .* passed 7s .*WITHOUT a slot.*CI's gate is the authority/);
+    assert.match(after, /PARTIAL LOCAL VERIFY finished with exit 3: .*7s wait.*CI's gate is the authority/);
+  } finally { s.done(); }
+});
+
+test('end to end: past the threshold the real command runs without a slot and sees AGENT_HOOKS_VERIFY_FALLBACK=1', () => {
+  const s = scratch();
+  try {
+    stamp(s.lock, process.pid, Date.now());
+    const r = spawnSync(process.execPath, [SCRIPT, s.lock, '--', 'node', '-e', "process.exit(process.env.AGENT_HOOKS_VERIFY_FALLBACK === '1' ? 4 : 9)"], {
+      encoding: 'utf8',
+      env: { ...process.env, AGENT_HOOKS_VERIFY_FALLBACK_AFTER_SECONDS: '1', AGENT_HOOKS_VERIFY_LOCK_WAIT_SECONDS: '30', AGENT_HOOKS_VERIFY_MAX_CONCURRENT: '1' },
+    });
+    assert.equal(r.status, 4, `the command did not see the variable (exit ${r.status}): ${r.stderr}`);
+    assert.match(r.stderr, /PARTIAL LOCAL VERIFY: .*passed 1s/);
     assert.equal(readOwner(s.lock).pid, process.pid, "it released the holder's lock");
   } finally { s.done(); }
 });
